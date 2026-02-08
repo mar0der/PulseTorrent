@@ -1,7 +1,7 @@
 [package]
 name = "torrent-rust"
 version = "0.1.0"
-description = "TorrentRust - Fast, open-source BitTorrent client"
+description = "PulseTorrent - Fast, open-source BitTorrent client"
 authors = ["you"]
 license = "MIT"
 repository = ""

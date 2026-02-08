@@ -515,27 +515,35 @@ async fn get_torrent_files(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<Vec<TorrentFileInfo>, String> {
-    let torrents = state.torrents.read().await;
-    let entry = torrents.get(&id).ok_or("Torrent not found")?;
+    // Extract what we need and release the read lock BEFORE awaiting the engine mutex.
+    // This avoids contention with poll_events which needs a write lock every second.
+    let (metainfo, engine_opt, saved_bitfield, num_pieces, skipped_files) = {
+        let torrents = state.torrents.read().await;
+        let entry = torrents.get(&id).ok_or("Torrent not found")?;
 
-    if entry.metainfo.piece_length == 0 {
-        return Ok(Vec::new()); // Placeholder entry, no metadata yet
-    }
+        if entry.metainfo.piece_length == 0 {
+            return Ok(Vec::new()); // Placeholder entry, no metadata yet
+        }
 
-    let num_pieces = entry.info.num_pieces;
+        (
+            entry.metainfo.clone(),
+            entry.engine.clone(),
+            entry.saved_bitfield.clone(),
+            entry.info.num_pieces,
+            entry.skipped_files.clone(),
+        )
+    }; // read lock released here
 
-    // Use live per-piece progress from engine (includes partial blocks),
-    // or reconstruct from saved bitfield (binary: 0.0 or 1.0 per piece).
-    let piece_progress: Vec<f64> = if let Some(engine) = &entry.engine {
+    let piece_progress: Vec<f64> = if let Some(engine) = engine_opt {
         engine.snapshot_piece_progress().await
     } else {
-        let bitfield = Bitfield::from_bytes(entry.saved_bitfield.clone(), num_pieces);
+        let bitfield = Bitfield::from_bytes(saved_bitfield, num_pieces);
         (0..num_pieces)
             .map(|i| if bitfield.has_piece(i) { 1.0 } else { 0.0 })
             .collect()
     };
 
-    Ok(calculate_file_progress(&entry.metainfo, &piece_progress, &entry.skipped_files))
+    Ok(calculate_file_progress(&metainfo, &piece_progress, &skipped_files))
 }
 
 #[tauri::command]

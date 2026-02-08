@@ -72,7 +72,8 @@ function App() {
     try {
       const files = await invoke<TorrentFileInfo[]>("get_torrent_files", { id });
       setFileList(files);
-    } catch (_) {
+    } catch (e) {
+      console.error("Failed to get torrent files:", e);
       setFileList([]);
     }
   }, []);
@@ -214,7 +215,7 @@ function App() {
     <div className="app">
       <header className="toolbar">
         <div className="toolbar-left">
-          <h1 className="app-title">TorrentRust</h1>
+          <h1 className="app-title">PulseTorrent</h1>
         </div>
         <div className="toolbar-actions">
           <button

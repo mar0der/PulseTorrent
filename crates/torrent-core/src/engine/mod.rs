@@ -361,6 +361,11 @@ impl TorrentEngine {
             stats.uploaded_bytes,
         )
     }
+
+    /// Get per-piece progress fractions (0.0-1.0) including partial blocks.
+    pub async fn snapshot_piece_progress(&self) -> Vec<f64> {
+        self.piece_manager.lock().await.piece_progress_fractions()
+    }
 }
 
 async fn handle_peer(

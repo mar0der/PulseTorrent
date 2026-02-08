@@ -143,9 +143,9 @@ fn compute_skipped_pieces(metainfo: &Metainfo, skipped_files: &HashSet<usize>) -
     skipped
 }
 
-/// Calculate per-file progress from a bitfield and metainfo.
-fn calculate_file_progress(metainfo: &Metainfo, bitfield_bytes: &[u8], num_pieces: usize, skipped_files: &HashSet<usize>) -> Vec<TorrentFileInfo> {
-    let bitfield = Bitfield::from_bytes(bitfield_bytes.to_vec(), num_pieces);
+/// Calculate per-file progress from per-piece progress fractions.
+/// Each entry in `piece_progress` is 0.0 (missing), 0.x (partial blocks), or 1.0 (complete).
+fn calculate_file_progress(metainfo: &Metainfo, piece_progress: &[f64], skipped_files: &HashSet<usize>) -> Vec<TorrentFileInfo> {
     let piece_length = metainfo.piece_length;
     let mut file_offset = 0u64;
 
@@ -163,7 +163,6 @@ fn calculate_file_progress(metainfo: &Metainfo, bitfield_bytes: &[u8], num_piece
             };
         }
 
-        // Which pieces does this file span?
         let first_piece = (file_start / piece_length) as usize;
         let last_piece = if file_end == 0 {
             0
@@ -171,24 +170,25 @@ fn calculate_file_progress(metainfo: &Metainfo, bitfield_bytes: &[u8], num_piece
             ((file_end - 1) / piece_length) as usize
         };
 
-        let mut completed_bytes = 0u64;
+        let mut completed_bytes = 0.0f64;
         for piece_idx in first_piece..=last_piece {
-            if piece_idx >= num_pieces {
+            if piece_idx >= piece_progress.len() {
                 break;
             }
-            if bitfield.has_piece(piece_idx) {
+            let frac = piece_progress[piece_idx];
+            if frac > 0.0 {
                 let piece_start = piece_idx as u64 * piece_length;
                 let piece_end = std::cmp::min(piece_start + piece_length, metainfo.total_size);
                 let overlap_start = std::cmp::max(piece_start, file_start);
                 let overlap_end = std::cmp::min(piece_end, file_end);
                 if overlap_end > overlap_start {
-                    completed_bytes += overlap_end - overlap_start;
+                    completed_bytes += (overlap_end - overlap_start) as f64 * frac;
                 }
             }
         }
 
         let progress = if file.length > 0 {
-            completed_bytes as f64 / file.length as f64
+            (completed_bytes / file.length as f64).min(1.0)
         } else {
             0.0
         };
@@ -524,15 +524,18 @@ async fn get_torrent_files(
 
     let num_pieces = entry.info.num_pieces;
 
-    // Use live bitfield from engine if running, otherwise saved
-    let bitfield_bytes = if let Some(engine) = &entry.engine {
-        let (bf, _, _, _) = engine.snapshot_state().await;
-        bf
+    // Use live per-piece progress from engine (includes partial blocks),
+    // or reconstruct from saved bitfield (binary: 0.0 or 1.0 per piece).
+    let piece_progress: Vec<f64> = if let Some(engine) = &entry.engine {
+        engine.snapshot_piece_progress().await
     } else {
-        entry.saved_bitfield.clone()
+        let bitfield = Bitfield::from_bytes(entry.saved_bitfield.clone(), num_pieces);
+        (0..num_pieces)
+            .map(|i| if bitfield.has_piece(i) { 1.0 } else { 0.0 })
+            .collect()
     };
 
-    Ok(calculate_file_progress(&entry.metainfo, &bitfield_bytes, num_pieces, &entry.skipped_files))
+    Ok(calculate_file_progress(&entry.metainfo, &piece_progress, &entry.skipped_files))
 }
 
 #[tauri::command]

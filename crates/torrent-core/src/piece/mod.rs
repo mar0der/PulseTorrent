@@ -373,4 +373,19 @@ impl PieceManager {
     pub fn bitfield_bytes(&self) -> Vec<u8> {
         self.our_bitfield.as_bytes().to_vec()
     }
+
+    /// Per-piece progress fractions (0.0 = missing, 0.x = partial, 1.0 = complete).
+    /// Accounts for partially-downloaded blocks in in-progress pieces.
+    pub fn piece_progress_fractions(&self) -> Vec<f64> {
+        (0..self.metainfo.num_pieces())
+            .map(|i| match self.piece_status[i] {
+                PieceStatus::Complete => 1.0,
+                PieceStatus::InProgress => self.in_progress.get(&i).map_or(0.0, |work| {
+                    let received = work.blocks_received.iter().filter(|&&b| b).count();
+                    received as f64 / work.blocks_total.max(1) as f64
+                }),
+                PieceStatus::Missing => 0.0,
+            })
+            .collect()
+    }
 }

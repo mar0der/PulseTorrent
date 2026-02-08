@@ -95,7 +95,7 @@ jobs:
         run: |
           TAG="${{ github.ref_name }}"
           LABEL="${{ matrix.label }}"
-          BUNDLE_DIR="ui/src-tauri/target/${{ matrix.target }}/release/bundle"
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
 
           upload() {
             local src="$1" name="$2"

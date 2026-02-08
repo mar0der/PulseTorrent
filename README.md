@@ -56,9 +56,18 @@ cargo tauri build
 
 Output: `.app` bundle and `.dmg` installer in `target/release/bundle/`.
 
-## Platform support
+## Downloads
 
-PulseTorrent is built on Tauri which supports macOS, Windows, and Linux. Currently tested on macOS (Apple Silicon). Windows and Linux builds are planned.
+Pre-built binaries are available on the [Releases](https://github.com/mar0der/PulseTorrent/releases) page:
+
+| Platform | Architecture | Format |
+|----------|-------------|--------|
+| macOS | Apple Silicon (arm64) | `.dmg` |
+| macOS | Intel (x86_64) | `.dmg` |
+| Windows | x86_64 | `.msi` |
+| Linux | x86_64 | `.deb`, `.AppImage` |
+
+Releases are built automatically via GitHub Actions on every tagged version.
 
 ## Roadmap
 
@@ -67,7 +76,6 @@ PulseTorrent is built on Tauri which supports macOS, Windows, and Linux. Current
 - [ ] Choking algorithm (unchoke top 4 + optimistic)
 - [ ] Endgame mode
 - [ ] Multiple tracker tiers / announce-list cycling
-- [ ] Windows & Linux testing and CI
 
 ## License
 

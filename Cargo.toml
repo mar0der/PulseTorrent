@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/torrent-core", "ui/src-tauri"]
+resolver = "2"

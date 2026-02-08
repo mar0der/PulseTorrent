@@ -896,31 +896,37 @@ pub fn run() {
                         }
                     }
                 }
-                // Save all torrent states before exiting
+                // Save all torrent states before exiting.
+                // Wrapped in catch_unwind because block_on can panic if the
+                // tokio runtime is already shutting down, and panicking across
+                // the FFI boundary (tao's applicationWillTerminate) causes SIGABRT.
                 tauri::RunEvent::Exit => {
-                    let app_state = app.state::<AppState>();
-                    let state_dir = app_state.state_dir.clone();
-                    let handle = tokio::runtime::Handle::current();
-                    handle.block_on(async {
-                        let mut torrents = app_state.torrents.write().await;
-                        for entry in torrents.values_mut() {
-                            // Skip placeholder entries (no metadata yet)
-                            if entry.metainfo.piece_length == 0 {
-                                continue;
-                            }
-                            // Snapshot live engine state before saving
-                            if let Some(engine) = &entry.engine {
-                                let (bitfield, _, downloaded, uploaded) = engine.snapshot_state().await;
-                                entry.saved_bitfield = bitfield;
-                                entry.info.downloaded_bytes = downloaded;
-                                entry.info.uploaded_bytes = uploaded;
-                            }
-                            let ts = build_torrent_state(entry);
-                            if let Err(e) = persistence::save_state(&ts, &state_dir).await {
-                                log::error!("Failed to save state on exit: {}", e);
-                            }
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let app_state = app.state::<AppState>();
+                        let state_dir = app_state.state_dir.clone();
+                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                            handle.block_on(async {
+                                let mut torrents = app_state.torrents.write().await;
+                                for entry in torrents.values_mut() {
+                                    // Skip placeholder entries (no metadata yet)
+                                    if entry.metainfo.piece_length == 0 {
+                                        continue;
+                                    }
+                                    // Snapshot live engine state before saving
+                                    if let Some(engine) = &entry.engine {
+                                        let (bitfield, _, downloaded, uploaded) = engine.snapshot_state().await;
+                                        entry.saved_bitfield = bitfield;
+                                        entry.info.downloaded_bytes = downloaded;
+                                        entry.info.uploaded_bytes = uploaded;
+                                    }
+                                    let ts = build_torrent_state(entry);
+                                    if let Err(e) = persistence::save_state(&ts, &state_dir).await {
+                                        log::error!("Failed to save state on exit: {}", e);
+                                    }
+                                }
+                            });
                         }
-                    });
+                    }));
                 }
                 _ => {}
             }

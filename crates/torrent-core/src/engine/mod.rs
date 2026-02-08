@@ -388,7 +388,8 @@ async fn handle_peer(
     let mut peer_bitfield = Bitfield::new(num_pieces);
     let mut _am_interested = false;
     let mut peer_choking = true;
-    let mut pending_requests: Vec<crate::piece::BlockRequest> = Vec::new();
+    let mut unsent_requests: Vec<crate::piece::BlockRequest> = Vec::new();
+    let mut in_flight: usize = 0;
     let mut current_piece: Option<usize> = None;
 
     // Send interested
@@ -408,7 +409,8 @@ async fn handle_peer(
                             if let Some(idx) = current_piece.take() {
                                 piece_manager.lock().await.reset_piece(idx);
                             }
-                            pending_requests.clear();
+                            unsent_requests.clear();
+                            in_flight = 0;
                         }
                         Message::Unchoke => {
                             peer_choking = false;
@@ -419,11 +421,14 @@ async fn handle_peer(
                                 if let Some(piece_idx) = pm.pick_piece(&peer_bitfield, &avail) {
                                     let blocks = pm.start_piece(piece_idx);
                                     current_piece = Some(piece_idx);
-                                    pending_requests = blocks;
+                                    unsent_requests = blocks;
+                                    in_flight = 0;
                                 }
                             }
                             // Send up to 5 pipelined requests
-                            let to_send: Vec<_> = pending_requests.iter().take(5).cloned().collect();
+                            let count = std::cmp::min(5, unsent_requests.len());
+                            let to_send: Vec<_> = unsent_requests.drain(..count).collect();
+                            in_flight += to_send.len();
                             for req in &to_send {
                                 conn.send(&Message::Request {
                                     index: req.piece_index,
@@ -466,10 +471,7 @@ async fn handle_peer(
                                 s.downloaded_bytes += block_len;
                             }
 
-                            // Remove this from pending
-                            pending_requests.retain(|r| {
-                                !(r.piece_index == index && r.offset == begin)
-                            });
+                            in_flight = in_flight.saturating_sub(1);
 
                             if complete {
                                 let valid = pm.finalize_piece(index as usize).await?;
@@ -477,6 +479,8 @@ async fn handle_peer(
                                     let _ = event_tx.send(EngineEvent::PieceCompleted(index as usize));
                                 }
                                 current_piece = None;
+                                unsent_requests.clear();
+                                in_flight = 0;
 
                                 // Pick next piece
                                 if !peer_choking {
@@ -484,14 +488,17 @@ async fn handle_peer(
                                     if let Some(next_idx) = pm.pick_piece(&peer_bitfield, &avail) {
                                         let blocks = pm.start_piece(next_idx);
                                         current_piece = Some(next_idx);
-                                        pending_requests = blocks;
+                                        unsent_requests = blocks;
                                     }
                                 }
                             }
 
-                            // Pipeline more requests
+                            // Pipeline more requests — only send enough to fill up to 5 in-flight
                             if !peer_choking {
-                                let to_send: Vec<_> = pending_requests.iter().take(5).cloned().collect();
+                                let pipeline_slots = 5usize.saturating_sub(in_flight);
+                                let count = std::cmp::min(pipeline_slots, unsent_requests.len());
+                                let to_send: Vec<_> = unsent_requests.drain(..count).collect();
+                                in_flight += to_send.len();
                                 for req in &to_send {
                                     conn.send(&Message::Request {
                                         index: req.piece_index,

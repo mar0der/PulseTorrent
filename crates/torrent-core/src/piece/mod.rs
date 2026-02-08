@@ -119,20 +119,27 @@ impl PieceManager {
     }
 
     /// Generate block requests for a piece.
+    /// If the piece has partial data from a previous peer, only the missing blocks are requested.
     pub fn start_piece(&mut self, piece_index: usize) -> Vec<BlockRequest> {
         let piece_size = self.metainfo.piece_size(piece_index) as u32;
         let num_blocks = (piece_size + STANDARD_BLOCK_SIZE - 1) / STANDARD_BLOCK_SIZE;
 
-        let work = PieceWork {
-            data: vec![0u8; piece_size as usize],
-            blocks_received: vec![false; num_blocks as usize],
-            blocks_total: num_blocks as usize,
-        };
+        // Reuse existing work if available (peer disconnected mid-piece)
+        if !self.in_progress.contains_key(&piece_index) {
+            let work = PieceWork {
+                data: vec![0u8; piece_size as usize],
+                blocks_received: vec![false; num_blocks as usize],
+                blocks_total: num_blocks as usize,
+            };
+            self.in_progress.insert(piece_index, work);
+        }
 
         self.piece_status[piece_index] = PieceStatus::InProgress;
-        self.in_progress.insert(piece_index, work);
 
+        // Only request blocks we haven't received yet
+        let work = self.in_progress.get(&piece_index).unwrap();
         (0..num_blocks)
+            .filter(|&i| !work.blocks_received[i as usize])
             .map(|i| {
                 let offset = i * STANDARD_BLOCK_SIZE;
                 let length = std::cmp::min(STANDARD_BLOCK_SIZE, piece_size - offset);
@@ -259,9 +266,10 @@ impl PieceManager {
         Ok(())
     }
 
-    /// Reset a piece back to missing (e.g. after timeout).
+    /// Reset a piece back to missing (e.g. after peer disconnect).
+    /// Keeps partial block data so the next peer can resume where the last left off.
     pub fn reset_piece(&mut self, piece_index: usize) {
-        self.in_progress.remove(&piece_index);
+        // Do NOT remove in_progress data — start_piece will reuse it
         if piece_index < self.piece_status.len() {
             self.piece_status[piece_index] = PieceStatus::Missing;
         }

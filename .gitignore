@@ -19,6 +19,9 @@ Thumbs.db
 # Environment / secrets
 .env
 .env.*
+*.p12
+*.cer
+*.certSigningRequest
 
 # Tauri build output
 ui/src-tauri/target/

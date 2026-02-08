@@ -26,24 +26,11 @@ jobs:
           **macOS Apple Silicon**: \`PulseTorrent-...-macOS-AppleSilicon.dmg\`
           **macOS Intel**: \`PulseTorrent-...-macOS-Intel.dmg\`
 
-          > **⚠️ macOS \"damaged\" warning:** Since the app is not yet code-signed, macOS will block it the first time.
-          > **Easy fix:** Download \`fix-macos-warning.command\` from the assets below, double-click it, and it will fix the app automatically.
-          >
-          > Or open Terminal and run:
-          > \`\`\`
-          > xattr -cr /Applications/PulseTorrent.app
-          > \`\`\`
-          > You only need to do this once.
+          The macOS builds are code-signed and notarized — just download, open, and run.
 
           **Windows**: \`PulseTorrent-...-Windows.msi\` — Download and run the installer.
 
           **Linux**: \`PulseTorrent-...-Linux.deb\` or \`.AppImage\`"
-
-      - name: Upload macOS fix script
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload "${{ github.ref_name }}" fix-macos-warning.command --clobber
 
   build:
     needs: create-release
@@ -92,6 +79,13 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS code signing & notarization (ignored on other platforms)
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: ui
           tauriScript: npx tauri

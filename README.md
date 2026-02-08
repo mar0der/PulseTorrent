@@ -69,15 +69,7 @@ Pre-built binaries are available on the [Releases](https://github.com/mar0der/Pu
 
 Releases are built automatically via GitHub Actions on every tagged version.
 
-### macOS — "damaged" warning fix
-
-Since the app is not code-signed, macOS may show a "damaged" error when you first open it. To fix this, open Terminal and run:
-
-```bash
-xattr -cr /Applications/PulseTorrent.app
-```
-
-Then open PulseTorrent normally. You only need to do this once.
+The macOS builds are code-signed and notarized with an Apple Developer ID — just download, open, and run. No Terminal commands needed.
 
 ## Roadmap
 

@@ -26,15 +26,24 @@ jobs:
           **macOS Apple Silicon**: \`PulseTorrent-...-macOS-AppleSilicon.dmg\`
           **macOS Intel**: \`PulseTorrent-...-macOS-Intel.dmg\`
 
-          > **Important — macOS \"damaged\" warning:** Since the app is not code-signed, macOS may block it. Open Terminal and run:
+          > **⚠️ macOS \"damaged\" warning:** Since the app is not yet code-signed, macOS will block it the first time.
+          > **Easy fix:** Download \`fix-macos-warning.command\` from the assets below, double-click it, and it will fix the app automatically.
+          >
+          > Or open Terminal and run:
           > \`\`\`
           > xattr -cr /Applications/PulseTorrent.app
           > \`\`\`
-          > Then open the app normally. You only need to do this once.
+          > You only need to do this once.
 
           **Windows**: \`PulseTorrent-...-Windows.msi\` — Download and run the installer.
 
           **Linux**: \`PulseTorrent-...-Linux.deb\` or \`.AppImage\`"
+
+      - name: Upload macOS fix script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" fix-macos-warning.command --clobber
 
   build:
     needs: create-release

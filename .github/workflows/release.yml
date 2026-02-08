@@ -9,23 +9,51 @@ permissions:
   contents: write
 
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --notes "See the assets below to download PulseTorrent for your platform.
+
+          ## Installation
+
+          **macOS Apple Silicon**: \`PulseTorrent-...-macOS-AppleSilicon.dmg\`
+          **macOS Intel**: \`PulseTorrent-...-macOS-Intel.dmg\`
+
+          > **Important — macOS \"damaged\" warning:** Since the app is not code-signed, macOS may block it. Open Terminal and run:
+          > \`\`\`
+          > xattr -cr /Applications/PulseTorrent.app
+          > \`\`\`
+          > Then open the app normally. You only need to do this once.
+
+          **Windows**: \`PulseTorrent-...-Windows.msi\` — Download and run the installer.
+
+          **Linux**: \`PulseTorrent-...-Linux.deb\` or \`.AppImage\`"
+
   build:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: macos-latest
             target: aarch64-apple-darwin
-            label: macOS-arm64
+            label: macOS-AppleSilicon
           - platform: macos-latest
             target: x86_64-apple-darwin
-            label: macOS-x86_64
+            label: macOS-Intel
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            label: Linux-x86_64
+            label: Linux
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-            label: Windows-x86_64
+            label: Windows
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -59,23 +87,43 @@ jobs:
           projectPath: ui
           tauriScript: npx tauri
           args: --target ${{ matrix.target }}
-          tagName: ${{ github.ref_name }}
-          releaseName: '${{ github.ref_name }}'
-          releaseBody: |
-            See the assets below to download PulseTorrent for your platform.
 
-            ## Installation
+      - name: Rename and upload artifacts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          TAG="${{ github.ref_name }}"
+          LABEL="${{ matrix.label }}"
+          BUNDLE_DIR="ui/src-tauri/target/${{ matrix.target }}/release/bundle"
 
-            **macOS**: Download the `.dmg` for your architecture (arm64 = Apple Silicon, x64 = Intel). Open the `.dmg` and drag PulseTorrent to Applications.
+          upload() {
+            local src="$1" name="$2"
+            cp "$src" "$name"
+            gh release upload "$TAG" "$name" --clobber
+            echo "Uploaded: $name"
+          }
 
-            > **Important — macOS "damaged" warning:** Since the app is not code-signed, macOS may block it. Open Terminal and run:
-            > ```
-            > xattr -cr /Applications/PulseTorrent.app
-            > ```
-            > Then open the app normally. You only need to do this once.
+          # macOS
+          if [[ "${{ matrix.platform }}" == "macos-latest" ]]; then
+            DMG=$(find "$BUNDLE_DIR" -name "*.dmg" | head -1)
+            [ -n "$DMG" ] && upload "$DMG" "PulseTorrent-${TAG}-${LABEL}.dmg"
+          fi
 
-            **Windows**: Download and run the `.msi` installer.
+          # Linux
+          if [[ "${{ matrix.platform }}" == "ubuntu-22.04" ]]; then
+            DEB=$(find "$BUNDLE_DIR" -name "*.deb" | head -1)
+            [ -n "$DEB" ] && upload "$DEB" "PulseTorrent-${TAG}-${LABEL}.deb"
 
-            **Linux**: Download the `.deb` package or `.AppImage`.
-          releaseDraft: false
-          prerelease: false
+            APPIMAGE=$(find "$BUNDLE_DIR" -name "*.AppImage" | head -1)
+            [ -n "$APPIMAGE" ] && upload "$APPIMAGE" "PulseTorrent-${TAG}-${LABEL}.AppImage"
+          fi
+
+          # Windows
+          if [[ "${{ matrix.platform }}" == "windows-latest" ]]; then
+            MSI=$(find "$BUNDLE_DIR" -name "*.msi" | head -1)
+            [ -n "$MSI" ] && upload "$MSI" "PulseTorrent-${TAG}-${LABEL}.msi"
+
+            EXE=$(find "$BUNDLE_DIR" -name "*setup*.exe" -o -name "*-setup.exe" | head -1)
+            [ -n "$EXE" ] && upload "$EXE" "PulseTorrent-${TAG}-${LABEL}-setup.exe"
+          fi

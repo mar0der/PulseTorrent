@@ -282,9 +282,11 @@ impl TorrentEngine {
                         let mut s = stats.write().await;
                         s.update();
                         let pm = pm.lock().await;
+                        // Report effective total (minus skipped) so progress reaches 100%
+                        let effective_total = pm.total_pieces().saturating_sub(pm.skipped_count());
                         let _ = event_tx.send(EngineEvent::Progress {
                             pieces_done: pm.completed_pieces(),
-                            pieces_total: pm.total_pieces(),
+                            pieces_total: effective_total,
                             downloaded_bytes: s.downloaded_bytes,
                             uploaded_bytes: s.uploaded_bytes,
                             download_speed: s.download_speed,

@@ -371,6 +371,11 @@
   color: var(--text-muted);
 }
 
+.file-progress-text.file-done {
+  color: #4caf50;
+  font-weight: 600;
+}
+
 /* Skipped file */
 .file-item.skipped {
   opacity: 0.45;

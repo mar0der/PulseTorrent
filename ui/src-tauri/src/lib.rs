@@ -9,7 +9,7 @@ use torrent_core::magnet::MagnetLink;
 use torrent_core::metadata;
 use torrent_core::peer::Bitfield;
 use torrent_core::persistence::{self, TorrentState};
-use torrent_core::piece::PieceManager;
+use torrent_core::piece::{self as piece_ops, PieceManager};
 use torrent_core::torrent::Metainfo;
 
 /// Represents a torrent in the UI.
@@ -413,10 +413,12 @@ async fn start_torrent(
     // Verify pieces on disk
     let verified = pm.verify_pieces().await.map_err(|e| e.to_string())?;
 
-    // Update entry info with verified count
+    // Update entry info with verified count (progress accounts for skipped pieces)
+    let skipped_count = pm.skipped_count();
+    let effective_total = entry.info.num_pieces.saturating_sub(skipped_count);
     entry.info.pieces_done = verified;
-    entry.info.progress = if entry.info.num_pieces > 0 {
-        verified as f64 / entry.info.num_pieces as f64
+    entry.info.progress = if effective_total > 0 {
+        verified as f64 / effective_total as f64
     } else {
         0.0
     };
@@ -445,6 +447,17 @@ async fn start_torrent(
     entry.engine = Some(engine);
     entry.event_rx = Some(event_rx);
     entry.info.status = "downloading".to_string();
+
+    // Pre-allocate in background — uses standalone function so it does NOT hold the
+    // piece_manager lock, allowing downloads to proceed in parallel on slow volumes.
+    let meta = entry.metainfo.clone();
+    let dl_dir = entry.download_dir.clone();
+    let skipped = entry.skipped_files.clone();
+    tokio::spawn(async move {
+        if let Err(e) = piece_ops::preallocate_files(&meta, &dl_dir, &skipped).await {
+            log::warn!("File pre-allocation failed: {}", e);
+        }
+    });
 
     Ok(())
 }
@@ -560,7 +573,8 @@ async fn toggle_file_skip(
     }
 
     // Toggle
-    if entry.skipped_files.contains(&file_index) {
+    let was_skipped = entry.skipped_files.contains(&file_index);
+    if was_skipped {
         entry.skipped_files.remove(&file_index);
     } else {
         entry.skipped_files.insert(file_index);
@@ -570,6 +584,17 @@ async fn toggle_file_skip(
     let skipped_pieces = compute_skipped_pieces(&entry.metainfo, &entry.skipped_files);
     if let Some(engine) = &entry.engine {
         engine.set_skipped_pieces(skipped_pieces).await;
+    }
+
+    // When unskipping, pre-allocate the file (standalone — no piece_manager lock)
+    if was_skipped {
+        let meta = entry.metainfo.clone();
+        let dl_dir = entry.download_dir.clone();
+        tokio::spawn(async move {
+            if let Err(e) = piece_ops::preallocate_file_by_index(&meta, &dl_dir, file_index).await {
+                log::warn!("Failed to pre-allocate unskipped file: {}", e);
+            }
+        });
     }
 
     // Save state
@@ -862,6 +887,15 @@ pub fn run() {
                                     entry.event_rx = Some(event_rx);
                                     entry.info.status = "downloading".to_string();
                                     log::info!("Auto-started torrent: {}", id);
+
+                                    let meta = entry.metainfo.clone();
+                                    let dl_dir = entry.download_dir.clone();
+                                    let skipped = entry.skipped_files.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = piece_ops::preallocate_files(&meta, &dl_dir, &skipped).await {
+                                            log::warn!("File pre-allocation failed: {}", e);
+                                        }
+                                    });
                                 }
                                 Err(e) => {
                                     log::error!("Failed to auto-start torrent {}: {}", id, e);

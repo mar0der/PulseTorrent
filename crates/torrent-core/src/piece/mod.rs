@@ -377,6 +377,11 @@ impl PieceManager {
         Ok(data)
     }
 
+    /// Return the number of pieces that are skipped.
+    pub fn skipped_count(&self) -> usize {
+        self.skipped_pieces.len()
+    }
+
     /// Get the raw bitfield bytes for persistence.
     pub fn bitfield_bytes(&self) -> Vec<u8> {
         self.our_bitfield.as_bytes().to_vec()
@@ -396,4 +401,59 @@ impl PieceManager {
             })
             .collect()
     }
+}
+
+/// Pre-allocate files on disk at their full size. Standalone function that does NOT
+/// require holding the PieceManager lock, so downloads can proceed in parallel.
+pub async fn preallocate_files(
+    metainfo: &Metainfo,
+    download_dir: &std::path::Path,
+    skipped_files: &HashSet<usize>,
+) -> Result<(), PieceError> {
+    for (file_idx, file_info) in metainfo.files.iter().enumerate() {
+        if skipped_files.contains(&file_idx) {
+            continue;
+        }
+        allocate_single_file(download_dir, file_info).await?;
+    }
+    Ok(())
+}
+
+/// Pre-allocate a single file by index. Standalone — no PieceManager lock needed.
+pub async fn preallocate_file_by_index(
+    metainfo: &Metainfo,
+    download_dir: &std::path::Path,
+    file_index: usize,
+) -> Result<(), PieceError> {
+    if let Some(file_info) = metainfo.files.get(file_index) {
+        allocate_single_file(download_dir, file_info).await?;
+    }
+    Ok(())
+}
+
+async fn allocate_single_file(
+    download_dir: &std::path::Path,
+    file_info: &crate::torrent::FileInfo,
+) -> Result<(), PieceError> {
+    let file_path = download_dir.join(&file_info.path);
+
+    if let Some(parent) = file_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+
+    let needs_alloc = match fs::metadata(&file_path).await {
+        Ok(meta) => meta.len() < file_info.length,
+        Err(_) => true,
+    };
+
+    if needs_alloc {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&file_path)
+            .await?;
+        file.set_len(file_info.length).await?;
+        log::info!("Pre-allocated: {} ({} bytes)", file_path.display(), file_info.length);
+    }
+    Ok(())
 }

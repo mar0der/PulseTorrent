@@ -51,6 +51,7 @@ function App() {
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; fileIndex: number } | null>(null);
   const pollRef = useRef<number | null>(null);
   const torrentsRef = useRef<TorrentInfo[]>([]);
+  const fileRequestGen = useRef(0);
 
   // Load default download dir on mount
   useEffect(() => {
@@ -68,13 +69,20 @@ function App() {
   }, []);
 
   const refreshFiles = useCallback(async (id: string | null) => {
+    const gen = ++fileRequestGen.current;
     if (!id) { setFileList([]); return; }
     try {
       const files = await invoke<TorrentFileInfo[]>("get_torrent_files", { id });
-      setFileList(files);
+      // Only update if no newer request has been issued (prevents stale responses
+      // from overwriting correct data when switching torrent selection).
+      if (fileRequestGen.current === gen) {
+        setFileList(files);
+      }
     } catch (e) {
       console.error("Failed to get torrent files:", e);
-      setFileList([]);
+      if (fileRequestGen.current === gen) {
+        setFileList([]);
+      }
     }
   }, []);
 
@@ -282,25 +290,14 @@ function App() {
                   <div
                     className="progress-fill"
                     style={{
-                      width: `${Math.min(
-                        t.total_size > 0
-                          ? (t.downloaded_bytes / t.total_size) * 100
-                          : t.progress * 100,
-                        100
-                      )}%`,
+                      width: `${Math.min(t.progress * 100, 100)}%`,
                     }}
                   />
                 </div>
 
                 <div className="torrent-stats">
                   <span>
-                    {t.total_size > 0
-                      ? Math.min(
-                          (t.downloaded_bytes / t.total_size) * 100,
-                          100
-                        ).toFixed(1)
-                      : (t.progress * 100).toFixed(1)}
-                    %
+                    {Math.min(t.progress * 100, 100).toFixed(1)}%
                   </span>
                   <span>
                     {formatBytes(t.downloaded_bytes)} /{" "}
@@ -458,8 +455,8 @@ function App() {
                           style={{ width: `${f.progress * 100}%` }}
                         />
                       </div>
-                      <span className="file-progress-text">
-                        {f.skipped ? "Skipped" : `${(f.progress * 100).toFixed(1)}%`}
+                      <span className={`file-progress-text ${f.progress >= 1.0 ? "file-done" : ""}`}>
+                        {f.skipped ? "Skipped" : f.progress >= 1.0 ? "Done" : `${(f.progress * 100).toFixed(1)}%`}
                       </span>
                     </div>
                   ))}

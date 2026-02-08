@@ -64,8 +64,18 @@ jobs:
           releaseBody: |
             See the assets below to download PulseTorrent for your platform.
 
-            **macOS**: Download the `.dmg`, open it, drag to Applications. On first launch right-click and select "Open" (unsigned app).
-            **Windows**: Download the `.msi` installer.
+            ## Installation
+
+            **macOS**: Download the `.dmg` for your architecture (arm64 = Apple Silicon, x64 = Intel). Open the `.dmg` and drag PulseTorrent to Applications.
+
+            > **Important — macOS "damaged" warning:** Since the app is not code-signed, macOS may block it. Open Terminal and run:
+            > ```
+            > xattr -cr /Applications/PulseTorrent.app
+            > ```
+            > Then open the app normally. You only need to do this once.
+
+            **Windows**: Download and run the `.msi` installer.
+
             **Linux**: Download the `.deb` package or `.AppImage`.
           releaseDraft: false
           prerelease: false

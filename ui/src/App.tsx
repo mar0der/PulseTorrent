@@ -18,6 +18,8 @@ interface TorrentInfo {
   progress: number;
   seeders: number | null;
   leechers: number | null;
+  connected_seeders: number;
+  connected_leechers: number;
   download_dir: string;
   eta_secs: number | null;
   warning: string | null;
@@ -351,12 +353,12 @@ function App() {
                       )}
                     </>
                   )}
-                  {t.status === "downloading" && (
+                  {(t.status === "downloading" || t.status === "complete") && (
                     <>
                       <span>&#8595; {formatSpeed(t.download_speed)}</span>
                       <span>&#8593; {formatSpeed(t.upload_speed)}</span>
-                      <span>{t.num_peers} peers</span>
-                      {t.eta_secs !== null && (
+                      <span>{t.num_peers} peers ({t.connected_seeders}S / {t.connected_leechers}L)</span>
+                      {t.status === "downloading" && t.eta_secs !== null && (
                         <span className="stat-eta">ETA: {formatEta(t.eta_secs)}</span>
                       )}
                     </>
@@ -448,7 +450,7 @@ function App() {
               </div>
               {selectedTorrent.seeders !== null && (
                 <div className="detail-row">
-                  <span className="detail-label">Seeders</span>
+                  <span className="detail-label">Swarm Seeders</span>
                   <span className="detail-value detail-seeders">
                     {selectedTorrent.seeders}
                   </span>
@@ -456,16 +458,16 @@ function App() {
               )}
               {selectedTorrent.leechers !== null && (
                 <div className="detail-row">
-                  <span className="detail-label">Leechers</span>
+                  <span className="detail-label">Swarm Leechers</span>
                   <span className="detail-value detail-leechers">
                     {selectedTorrent.leechers}
                   </span>
                 </div>
               )}
               <div className="detail-row">
-                <span className="detail-label">Peers</span>
+                <span className="detail-label">Connected Peers</span>
                 <span className="detail-value">
-                  {selectedTorrent.num_peers}
+                  {selectedTorrent.num_peers} ({selectedTorrent.connected_seeders} seeders, {selectedTorrent.connected_leechers} leechers)
                 </span>
               </div>
               {selectedTorrent.eta_secs !== null && selectedTorrent.status === "downloading" && (

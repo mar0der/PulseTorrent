@@ -29,6 +29,10 @@ pub struct TorrentInfo {
     pub progress: f64,
     pub seeders: Option<u64>,
     pub leechers: Option<u64>,
+    /// How many of our connected peers are seeders (have all pieces).
+    pub connected_seeders: usize,
+    /// How many of our connected peers are leechers (missing some pieces).
+    pub connected_leechers: usize,
     pub download_dir: String,
     /// Estimated time remaining in seconds (None when paused or speed is zero).
     pub eta_secs: Option<u64>,
@@ -239,6 +243,8 @@ async fn add_torrent(
         progress: 0.0,
         seeders: None,
         leechers: None,
+        connected_seeders: 0,
+        connected_leechers: 0,
         download_dir: dl_dir.to_string_lossy().to_string(),
         eta_secs: None,
         warning: None,
@@ -304,6 +310,8 @@ async fn add_magnet(
         progress: 0.0,
         seeders: None,
         leechers: None,
+        connected_seeders: 0,
+        connected_leechers: 0,
         download_dir: dl_dir.to_string_lossy().to_string(),
         eta_secs: None,
         warning: None,
@@ -363,6 +371,8 @@ async fn add_magnet(
         progress: 0.0,
         seeders: None,
         leechers: None,
+        connected_seeders: 0,
+        connected_leechers: 0,
         download_dir: dl_dir.to_string_lossy().to_string(),
         eta_secs: None,
         warning: None,
@@ -735,6 +745,8 @@ async fn poll_events(
                     num_peers,
                     seeders,
                     leechers,
+                    connected_seeders,
+                    connected_leechers,
                 } => {
                     entry.info.pieces_done = *pieces_done;
                     entry.info.warning = None; // Clear warning on successful progress
@@ -745,6 +757,8 @@ async fn poll_events(
                     entry.info.num_peers = *num_peers;
                     entry.info.seeders = *seeders;
                     entry.info.leechers = *leechers;
+                    entry.info.connected_seeders = *connected_seeders;
+                    entry.info.connected_leechers = *connected_leechers;
                     entry.info.progress = if *pieces_total > 0 {
                         *pieces_done as f64 / *pieces_total as f64
                     } else {
@@ -940,6 +954,8 @@ pub fn run() {
                                 progress,
                                 seeders: None,
                                 leechers: None,
+                                connected_seeders: 0,
+                                connected_leechers: 0,
                                 download_dir: saved.download_dir.to_string_lossy().to_string(),
                                 eta_secs: None,
                                 warning: None,

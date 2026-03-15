@@ -322,6 +322,45 @@ impl PeerConnection {
         Ok((conn, peer_handshake))
     }
 
+    /// Accept an incoming connection: read the peer's handshake first, verify info_hash,
+    /// then send ours back.
+    pub async fn accept(
+        stream: TcpStream,
+        info_hash: [u8; 20],
+        peer_id: [u8; 20],
+    ) -> Result<(Self, Handshake), PeerError> {
+        let mut conn = Self {
+            stream,
+            read_buf: BytesMut::with_capacity(65536),
+        };
+
+        // Read their handshake first
+        let mut handshake_buf = [0u8; 68];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            conn.stream.read_exact(&mut handshake_buf),
+        )
+        .await
+        .map_err(|_| PeerError::Timeout)?
+        .map_err(PeerError::Io)?;
+
+        let peer_handshake = Handshake::from_bytes(&handshake_buf)?;
+
+        // Verify info hash matches our torrent
+        if peer_handshake.info_hash != info_hash {
+            return Err(PeerError::InfoHashMismatch);
+        }
+
+        // Send our handshake back
+        let handshake = Handshake::new(info_hash, peer_id);
+        conn.stream
+            .write_all(&handshake.to_bytes())
+            .await
+            .map_err(PeerError::Io)?;
+
+        Ok((conn, peer_handshake))
+    }
+
     /// Send a message to the peer.
     pub async fn send(&mut self, msg: &Message) -> Result<(), PeerError> {
         self.stream

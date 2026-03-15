@@ -4,10 +4,11 @@ use crate::torrent::Metainfo;
 use crate::tracker::TrackerClient;
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::collections::HashSet;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::{Duration, Instant};
 
@@ -40,6 +41,10 @@ pub enum EngineEvent {
         num_peers: usize,
         seeders: Option<u64>,
         leechers: Option<u64>,
+        /// How many of our connected peers are seeders (have all pieces).
+        connected_seeders: usize,
+        /// How many of our connected peers are leechers (missing pieces).
+        connected_leechers: usize,
     },
     Error(String),
 }
@@ -103,6 +108,12 @@ pub struct TorrentEngine {
     leechers: Arc<RwLock<Option<u64>>>,
     /// Peers we've already tried connecting to (avoid duplicates across re-announces).
     known_peers: Arc<RwLock<HashSet<SocketAddrV4>>>,
+    /// The actual port we're listening on for incoming connections.
+    listen_port: Arc<AtomicU16>,
+    /// Number of connected peers that are seeders (have all pieces).
+    connected_seeders: Arc<AtomicUsize>,
+    /// Number of connected peers that are leechers (don't have all pieces).
+    connected_leechers: Arc<AtomicUsize>,
 }
 
 impl TorrentEngine {
@@ -132,11 +143,19 @@ impl TorrentEngine {
             seeders: Arc::new(RwLock::new(None)),
             leechers: Arc::new(RwLock::new(None)),
             known_peers: Arc::new(RwLock::new(HashSet::new())),
+            listen_port: Arc::new(AtomicU16::new(0)),
+            connected_seeders: Arc::new(AtomicUsize::new(0)),
+            connected_leechers: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     pub fn peer_id(&self) -> [u8; 20] {
         self.tracker_client.peer_id
+    }
+
+    /// Get the port we're listening on (0 if not yet started).
+    pub fn listen_port(&self) -> u16 {
+        self.listen_port.load(Ordering::Relaxed)
     }
 
     /// Collect all tracker URLs to try (primary + announce_list).
@@ -162,6 +181,24 @@ impl TorrentEngine {
         let metainfo = self.metainfo.clone();
         let pm = self.piece_manager.clone();
 
+        // Bind a TCP listener for incoming peer connections.
+        // Try port 6881 first (standard BT port), fall back to OS-assigned.
+        let listener = match TcpListener::bind("0.0.0.0:6881").await {
+            Ok(l) => l,
+            Err(_) => TcpListener::bind("0.0.0.0:0")
+                .await
+                .map_err(|e| EngineError::Peer(crate::peer::PeerError::Io(e)))?,
+        };
+        let actual_port = listener
+            .local_addr()
+            .map(|a| a.port())
+            .unwrap_or(6881);
+        self.listen_port.store(actual_port, Ordering::Relaxed);
+        log::info!("Listening for incoming peers on port {}", actual_port);
+
+        // Update tracker client to use our actual listen port
+        let tracker_client = TrackerClient::with_peer_id(self.tracker_client.peer_id, actual_port);
+
         // Calculate bytes remaining
         let left = {
             let pm = pm.lock().await;
@@ -172,7 +209,6 @@ impl TorrentEngine {
         // Try all trackers in parallel
         let tracker_urls = self.tracker_urls();
         let mut all_peers: Vec<SocketAddrV4> = Vec::new();
-        let tracker_client = self.tracker_client;
         let info_hash = metainfo.info_hash;
 
         let mut set = tokio::task::JoinSet::new();
@@ -253,6 +289,8 @@ impl TorrentEngine {
             let mut shutdown_rx = self.shutdown.subscribe();
             let active_peers = self.active_peers.clone();
             let sem = conn_semaphore.clone();
+            let c_seeders = self.connected_seeders.clone();
+            let c_leechers = self.connected_leechers.clone();
 
             tokio::spawn(async move {
                 // Stagger: small delay per batch to avoid burst
@@ -275,6 +313,8 @@ impl TorrentEngine {
                     availability,
                     peer_id,
                     &mut shutdown_rx,
+                    c_seeders,
+                    c_leechers,
                 )
                 .await;
                 active_peers.fetch_sub(1, Ordering::Relaxed);
@@ -282,6 +322,96 @@ impl TorrentEngine {
                 if let Err(e) = result {
                     log::debug!("Peer {} error: {}", peer_addr, e);
                     let _ = event_tx.send(EngineEvent::PeerDisconnected(peer_addr));
+                }
+            });
+        }
+
+        // Incoming connection listener: accept peers that connect to us
+        {
+            let metainfo = self.metainfo.clone();
+            let pm = self.piece_manager.clone();
+            let stats = self.stats.clone();
+            let event_tx = self.event_tx.clone();
+            let availability = self.availability.clone();
+            let active_peers = self.active_peers.clone();
+            let peer_id = self.tracker_client.peer_id;
+            let mut shutdown_rx = self.shutdown.subscribe();
+            let conn_semaphore = conn_semaphore.clone();
+            let info_hash = metainfo.info_hash;
+            let c_seeders = self.connected_seeders.clone();
+            let c_leechers = self.connected_leechers.clone();
+
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        accept_result = listener.accept() => {
+                            match accept_result {
+                                Ok((stream, remote_addr)) => {
+                                    log::info!("Incoming peer connection from {}", remote_addr);
+                                    let metainfo = metainfo.clone();
+                                    let pm = pm.clone();
+                                    let stats = stats.clone();
+                                    let event_tx = event_tx.clone();
+                                    let availability = availability.clone();
+                                    let active_peers = active_peers.clone();
+                                    let sem = conn_semaphore.clone();
+                                    let mut shutdown_rx = shutdown_rx.clone();
+                                    let c_seeders = c_seeders.clone();
+                                    let c_leechers = c_leechers.clone();
+
+                                    tokio::spawn(async move {
+                                        let _permit = match sem.acquire().await {
+                                            Ok(p) => p,
+                                            Err(_) => return,
+                                        };
+
+                                        // Perform handshake on the accepted stream
+                                        let (conn, _peer_hs) = match PeerConnection::accept(
+                                            stream,
+                                            info_hash,
+                                            peer_id,
+                                        ).await {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                log::debug!("Incoming handshake failed from {}: {}", remote_addr, e);
+                                                return;
+                                            }
+                                        };
+
+                                        // Derive a SocketAddrV4 for handle_peer
+                                        let addr = match remote_addr {
+                                            std::net::SocketAddr::V4(a) => a,
+                                            std::net::SocketAddr::V6(_) => return, // skip IPv6 for now
+                                        };
+
+                                        active_peers.fetch_add(1, Ordering::Relaxed);
+                                        let result = handle_peer_with_conn(
+                                            addr,
+                                            conn,
+                                            metainfo,
+                                            pm,
+                                            stats,
+                                            event_tx.clone(),
+                                            availability,
+                                            &mut shutdown_rx,
+                                            c_seeders,
+                                            c_leechers,
+                                        ).await;
+                                        active_peers.fetch_sub(1, Ordering::Relaxed);
+
+                                        if let Err(e) = result {
+                                            log::debug!("Incoming peer {} error: {}", addr, e);
+                                            let _ = event_tx.send(EngineEvent::PeerDisconnected(addr));
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    log::debug!("Failed to accept incoming connection: {}", e);
+                                }
+                            }
+                        }
+                        _ = shutdown_rx.changed() => break,
+                    }
                 }
             });
         }
@@ -297,11 +427,13 @@ impl TorrentEngine {
             let known_peers = self.known_peers.clone();
             let seeders = self.seeders.clone();
             let leechers = self.leechers.clone();
-            let tracker_client = TrackerClient::new(6881);
+            let re_tracker_client = TrackerClient::with_peer_id(self.tracker_client.peer_id, actual_port);
             let tracker_urls = self.tracker_urls();
             let mut shutdown_rx = self.shutdown.subscribe();
             let conn_semaphore = conn_semaphore.clone();
             let peer_id = self.tracker_client.peer_id;
+            let c_seeders = self.connected_seeders.clone();
+            let c_leechers = self.connected_leechers.clone();
 
             tokio::spawn(async move {
                 // Wait 30s before first re-announce, then every 30s
@@ -312,12 +444,12 @@ impl TorrentEngine {
                     tokio::select! {
                         _ = interval.tick() => {
                             let current_peers = active_peers.load(Ordering::Relaxed);
-                            if current_peers >= 3 {
-                                continue; // Enough peers, skip re-announce
-                            }
+                            let is_complete = pm.lock().await.is_complete();
 
-                            // Skip re-announce if download is complete (seeding doesn't need more peers yet)
-                            if pm.lock().await.is_complete() {
+                            // When downloading, skip re-announce if we have enough peers.
+                            // When seeding, always re-announce to stay visible to leechers,
+                            // but use a lower threshold to avoid spamming.
+                            if !is_complete && current_peers >= 3 {
                                 continue;
                             }
 
@@ -335,7 +467,7 @@ impl TorrentEngine {
 
                             let mut all_tracker_peers = Vec::new();
                             for url in &tracker_urls {
-                                match tracker_client
+                                match re_tracker_client
                                     .announce_to_url(url, &info_hash, downloaded, uploaded, left, None)
                                     .await
                                 {
@@ -392,6 +524,8 @@ impl TorrentEngine {
                                 let active_peers = active_peers.clone();
                                 let sem = conn_semaphore.clone();
                                 let mut shutdown_rx = shutdown_rx.clone();
+                                let c_seeders = c_seeders.clone();
+                                let c_leechers = c_leechers.clone();
 
                                 tokio::spawn(async move {
                                     let _permit = match sem.acquire().await {
@@ -409,6 +543,8 @@ impl TorrentEngine {
                                         availability,
                                         peer_id,
                                         &mut shutdown_rx,
+                                        c_seeders,
+                                        c_leechers,
                                     )
                                     .await;
                                     active_peers.fetch_sub(1, Ordering::Relaxed);
@@ -434,9 +570,11 @@ impl TorrentEngine {
         let active_peers = self.active_peers.clone();
         let seeders = self.seeders.clone();
         let leechers = self.leechers.clone();
+        let connected_seeders = self.connected_seeders.clone();
+        let connected_leechers = self.connected_leechers.clone();
         let tracker_urls_for_complete = self.tracker_urls();
         let info_hash_for_complete = self.metainfo.info_hash.clone();
-        let tracker_for_complete = TrackerClient::new(6881);
+        let tracker_for_complete = TrackerClient::with_peer_id(self.tracker_client.peer_id, actual_port);
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -465,6 +603,8 @@ impl TorrentEngine {
                             num_peers: active_peers.load(Ordering::Relaxed),
                             seeders: *seeders.read().await,
                             leechers: *leechers.read().await,
+                            connected_seeders: connected_seeders.load(Ordering::Relaxed),
+                            connected_leechers: connected_leechers.load(Ordering::Relaxed),
                         });
                         if pm.is_complete() && !download_complete_sent {
                             let _ = event_tx.send(EngineEvent::DownloadComplete);
@@ -536,6 +676,9 @@ impl TorrentEngine {
             seeders: Arc::new(RwLock::new(None)),
             leechers: Arc::new(RwLock::new(None)),
             known_peers: Arc::new(RwLock::new(HashSet::new())),
+            listen_port: Arc::new(AtomicU16::new(0)),
+            connected_seeders: Arc::new(AtomicUsize::new(0)),
+            connected_leechers: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -571,6 +714,7 @@ impl TorrentEngine {
     }
 }
 
+/// Handle an outbound peer connection (we connect to them).
 async fn handle_peer(
     addr: SocketAddrV4,
     metainfo: Arc<Metainfo>,
@@ -580,11 +724,27 @@ async fn handle_peer(
     availability: Arc<RwLock<Vec<u32>>>,
     our_peer_id: [u8; 20],
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    connected_seeders: Arc<AtomicUsize>,
+    connected_leechers: Arc<AtomicUsize>,
 ) -> Result<(), EngineError> {
-    // Connect and handshake
-    let (mut conn, _peer_handshake) =
+    let (conn, _peer_handshake) =
         PeerConnection::connect(addr, metainfo.info_hash, our_peer_id).await?;
+    handle_peer_with_conn(addr, conn, metainfo, piece_manager, stats, event_tx, availability, shutdown_rx, connected_seeders, connected_leechers).await
+}
 
+/// Handle an already-established peer connection (used for both inbound and outbound).
+async fn handle_peer_with_conn(
+    addr: SocketAddrV4,
+    mut conn: PeerConnection,
+    metainfo: Arc<Metainfo>,
+    piece_manager: Arc<Mutex<PieceManager>>,
+    stats: Arc<RwLock<TransferStats>>,
+    event_tx: mpsc::UnboundedSender<EngineEvent>,
+    availability: Arc<RwLock<Vec<u32>>>,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    connected_seeders: Arc<AtomicUsize>,
+    connected_leechers: Arc<AtomicUsize>,
+) -> Result<(), EngineError> {
     let _ = event_tx.send(EngineEvent::PeerConnected(addr));
 
     let num_pieces = metainfo.num_pieces();
@@ -596,6 +756,7 @@ async fn handle_peer(
     let mut unsent_requests: Vec<crate::piece::BlockRequest> = Vec::new();
     let mut in_flight: usize = 0;
     let mut current_piece: Option<usize> = None;
+    let mut peer_is_seeder = false; // tracks if this peer has all pieces
 
     // Send our bitfield so the peer knows what we have
     {
@@ -668,6 +829,15 @@ async fn handle_peer(
                                         *count += 1;
                                     }
                                 }
+                            }
+                            // Classify peer as seeder or leecher
+                            if peer_bitfield.count_pieces() == num_pieces {
+                                peer_is_seeder = true;
+                                connected_seeders.fetch_add(1, Ordering::Relaxed);
+                                log::info!("Peer {} is a seeder (has all {} pieces)", addr, num_pieces);
+                            } else {
+                                connected_leechers.fetch_add(1, Ordering::Relaxed);
+                                log::info!("Peer {} is a leecher (has {}/{} pieces)", addr, peer_bitfield.count_pieces(), num_pieces);
                             }
                         }
                         Message::Piece { index, begin, block } => {
@@ -803,6 +973,14 @@ async fn handle_peer(
     // so other peers can pick it up. Without this, pieces get stuck as InProgress forever.
     if let Some(idx) = current_piece.take() {
         piece_manager.lock().await.reset_piece(idx);
+    }
+
+    // Decrement the seeder/leecher counter
+    if peer_is_seeder {
+        connected_seeders.fetch_sub(1, Ordering::Relaxed);
+    } else if peer_bitfield.count_pieces() > 0 {
+        // Only decrement if we actually counted this peer (got their bitfield)
+        connected_leechers.fetch_sub(1, Ordering::Relaxed);
     }
 
     result

@@ -39,6 +39,11 @@ impl TrackerClient {
         Self { peer_id, port }
     }
 
+    /// Create a tracker client with a specific peer_id and port.
+    pub fn with_peer_id(peer_id: [u8; 20], port: u16) -> Self {
+        Self { peer_id, port }
+    }
+
     /// Announce to the tracker specified in metainfo (primary announce URL).
     pub async fn announce(
         &self,

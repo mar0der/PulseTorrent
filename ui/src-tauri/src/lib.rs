@@ -1030,6 +1030,65 @@ async fn get_download_dir(state: State<'_, AppState>) -> Result<String, String> 
         .to_string())
 }
 
+#[tauri::command]
+async fn get_app_version(app: tauri::AppHandle) -> Result<String, String> {
+    Ok(app.package_info().version.to_string())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerInfoUI {
+    pub addr: String,
+    pub is_seeder: bool,
+    pub pieces_have: usize,
+    pub pieces_total: usize,
+    pub peer_interested: bool,
+    pub am_choking: bool,
+    pub peer_choking: bool,
+    pub client: String,
+}
+
+#[tauri::command]
+async fn get_peers(state: State<'_, AppState>, id: String) -> Result<Vec<PeerInfoUI>, String> {
+    let torrents = state.torrents.read().await;
+    let entry = torrents.get(&id).ok_or("torrent not found")?;
+    if let Some(engine) = &entry.engine {
+        let peers = engine.snapshot_peers().await;
+        Ok(peers.into_iter().map(|p| PeerInfoUI {
+            addr: p.addr.to_string(),
+            is_seeder: p.is_seeder,
+            pieces_have: p.pieces_have,
+            pieces_total: p.pieces_total,
+            peer_interested: p.peer_interested,
+            am_choking: p.am_choking,
+            peer_choking: p.peer_choking,
+            client: p.client,
+        }).collect())
+    } else {
+        Ok(vec![])
+    }
+}
+
+#[tauri::command]
+async fn get_piece_map(state: State<'_, AppState>, id: String) -> Result<Vec<f64>, String> {
+    let torrents = state.torrents.read().await;
+    let entry = torrents.get(&id).ok_or("torrent not found")?;
+    if let Some(engine) = &entry.engine {
+        Ok(engine.snapshot_piece_progress().await)
+    } else {
+        // Return from saved bitfield
+        let num_pieces = entry.info.num_pieces;
+        let mut progress = vec![0.0f64; num_pieces];
+        for i in 0..num_pieces {
+            let byte_idx = i / 8;
+            let bit_idx = 7 - (i % 8);
+            if byte_idx < entry.saved_bitfield.len() && (entry.saved_bitfield[byte_idx] & (1 << bit_idx)) != 0 {
+                progress[i] = 1.0;
+            }
+        }
+        Ok(progress)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GlobalStatsInfo {
     pub total_downloaded: u64,
@@ -1106,6 +1165,9 @@ pub fn run() {
             set_download_dir,
             get_download_dir,
             get_global_stats,
+            get_app_version,
+            get_peers,
+            get_piece_map,
         ])
         .on_window_event(|window, event| {
             // macOS: hide window instead of closing (minimize to dock)

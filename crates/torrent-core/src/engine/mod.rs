@@ -24,6 +24,25 @@ pub enum EngineError {
     NoPeers,
 }
 
+/// Info about a connected peer, for UI display.
+#[derive(Debug, Clone)]
+pub struct PeerInfo {
+    pub addr: SocketAddrV4,
+    pub is_seeder: bool,
+    /// How many pieces this peer has.
+    pub pieces_have: usize,
+    /// Total pieces in the torrent.
+    pub pieces_total: usize,
+    /// Whether peer is interested in our data.
+    pub peer_interested: bool,
+    /// Whether we are choking this peer.
+    pub am_choking: bool,
+    /// Whether peer is choking us.
+    pub peer_choking: bool,
+    /// Client identifier from handshake peer_id (e.g. "-qB4710-" → qBittorrent 4.7.1).
+    pub client: String,
+}
+
 /// Events emitted by the engine for the UI.
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
@@ -114,6 +133,8 @@ pub struct TorrentEngine {
     connected_seeders: Arc<AtomicUsize>,
     /// Number of connected peers that are leechers (don't have all pieces).
     connected_leechers: Arc<AtomicUsize>,
+    /// Registry of all currently connected peers (for UI display).
+    peer_registry: Arc<RwLock<std::collections::HashMap<SocketAddrV4, PeerInfo>>>,
 }
 
 impl TorrentEngine {
@@ -146,6 +167,7 @@ impl TorrentEngine {
             listen_port: Arc::new(AtomicU16::new(0)),
             connected_seeders: Arc::new(AtomicUsize::new(0)),
             connected_leechers: Arc::new(AtomicUsize::new(0)),
+            peer_registry: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 
@@ -291,6 +313,7 @@ impl TorrentEngine {
             let sem = conn_semaphore.clone();
             let c_seeders = self.connected_seeders.clone();
             let c_leechers = self.connected_leechers.clone();
+            let registry = self.peer_registry.clone();
 
             tokio::spawn(async move {
                 // Stagger: small delay per batch to avoid burst
@@ -315,9 +338,11 @@ impl TorrentEngine {
                     &mut shutdown_rx,
                     c_seeders,
                     c_leechers,
+                    registry.clone(),
                 )
                 .await;
                 active_peers.fetch_sub(1, Ordering::Relaxed);
+                registry.write().await.remove(&peer_addr);
 
                 if let Err(e) = result {
                     log::debug!("Peer {} error: {}", peer_addr, e);
@@ -340,6 +365,7 @@ impl TorrentEngine {
             let info_hash = metainfo.info_hash;
             let c_seeders = self.connected_seeders.clone();
             let c_leechers = self.connected_leechers.clone();
+            let registry = self.peer_registry.clone();
 
             tokio::spawn(async move {
                 loop {
@@ -358,6 +384,7 @@ impl TorrentEngine {
                                     let mut shutdown_rx = shutdown_rx.clone();
                                     let c_seeders = c_seeders.clone();
                                     let c_leechers = c_leechers.clone();
+                                    let registry = registry.clone();
 
                                     tokio::spawn(async move {
                                         let _permit = match sem.acquire().await {
@@ -366,7 +393,7 @@ impl TorrentEngine {
                                         };
 
                                         // Perform handshake on the accepted stream
-                                        let (conn, _peer_hs) = match PeerConnection::accept(
+                                        let (conn, peer_hs) = match PeerConnection::accept(
                                             stream,
                                             info_hash,
                                             peer_id,
@@ -384,10 +411,12 @@ impl TorrentEngine {
                                             std::net::SocketAddr::V6(_) => return, // skip IPv6 for now
                                         };
 
+                                        let client = parse_client_id(&peer_hs.peer_id);
                                         active_peers.fetch_add(1, Ordering::Relaxed);
                                         let result = handle_peer_with_conn(
                                             addr,
                                             conn,
+                                            client,
                                             metainfo,
                                             pm,
                                             stats,
@@ -396,6 +425,7 @@ impl TorrentEngine {
                                             &mut shutdown_rx,
                                             c_seeders,
                                             c_leechers,
+                                            registry,
                                         ).await;
                                         active_peers.fetch_sub(1, Ordering::Relaxed);
 
@@ -434,6 +464,7 @@ impl TorrentEngine {
             let peer_id = self.tracker_client.peer_id;
             let c_seeders = self.connected_seeders.clone();
             let c_leechers = self.connected_leechers.clone();
+            let registry = self.peer_registry.clone();
 
             tokio::spawn(async move {
                 // Wait 30s before first re-announce, then every 30s
@@ -526,6 +557,7 @@ impl TorrentEngine {
                                 let mut shutdown_rx = shutdown_rx.clone();
                                 let c_seeders = c_seeders.clone();
                                 let c_leechers = c_leechers.clone();
+                                let registry = registry.clone();
 
                                 tokio::spawn(async move {
                                     let _permit = match sem.acquire().await {
@@ -545,9 +577,11 @@ impl TorrentEngine {
                                         &mut shutdown_rx,
                                         c_seeders,
                                         c_leechers,
+                                        registry.clone(),
                                     )
                                     .await;
                                     active_peers.fetch_sub(1, Ordering::Relaxed);
+                                    registry.write().await.remove(&peer_addr);
 
                                     if let Err(e) = result {
                                         log::debug!("Peer {} error: {}", peer_addr, e);
@@ -679,6 +713,7 @@ impl TorrentEngine {
             listen_port: Arc::new(AtomicU16::new(0)),
             connected_seeders: Arc::new(AtomicUsize::new(0)),
             connected_leechers: Arc::new(AtomicUsize::new(0)),
+            peer_registry: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 
@@ -712,6 +747,39 @@ impl TorrentEngine {
     pub async fn snapshot_piece_progress(&self) -> Vec<f64> {
         self.piece_manager.lock().await.piece_progress_fractions()
     }
+
+    /// Get info about all currently connected peers.
+    pub async fn snapshot_peers(&self) -> Vec<PeerInfo> {
+        self.peer_registry.read().await.values().cloned().collect()
+    }
+}
+
+/// Parse a 20-byte peer_id into a human-readable client string.
+fn parse_client_id(peer_id: &[u8; 20]) -> String {
+    // Azureus-style: -XX0000- where XX is client code
+    if peer_id[0] == b'-' && peer_id[7] == b'-' {
+        let code = std::str::from_utf8(&peer_id[1..3]).unwrap_or("??");
+        let ver = std::str::from_utf8(&peer_id[3..7]).unwrap_or("????");
+        let name = match code {
+            "qB" => "qBittorrent",
+            "UT" => "µTorrent",
+            "TR" => "Transmission",
+            "DE" => "Deluge",
+            "AZ" => "Azureus/Vuze",
+            "LT" => "libtorrent",
+            "lt" => "libtorrent",
+            "BT" => "BitTorrent",
+            "BI" => "BiglyBT",
+            "FD" => "Free Download Manager",
+            "WB" => "WebTorrent",
+            "PT" => "PulseTorrent",
+            _ => code,
+        };
+        format!("{} {}", name, ver.trim_start_matches('0'))
+    } else {
+        // Shadow-style or unknown — show first 8 bytes as hex
+        format!("{:02x}{:02x}{:02x}{:02x}", peer_id[0], peer_id[1], peer_id[2], peer_id[3])
+    }
 }
 
 /// Handle an outbound peer connection (we connect to them).
@@ -726,16 +794,19 @@ async fn handle_peer(
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     connected_seeders: Arc<AtomicUsize>,
     connected_leechers: Arc<AtomicUsize>,
+    registry: Arc<RwLock<std::collections::HashMap<SocketAddrV4, PeerInfo>>>,
 ) -> Result<(), EngineError> {
-    let (conn, _peer_handshake) =
+    let (conn, peer_handshake) =
         PeerConnection::connect(addr, metainfo.info_hash, our_peer_id).await?;
-    handle_peer_with_conn(addr, conn, metainfo, piece_manager, stats, event_tx, availability, shutdown_rx, connected_seeders, connected_leechers).await
+    let client = parse_client_id(&peer_handshake.peer_id);
+    handle_peer_with_conn(addr, conn, client, metainfo, piece_manager, stats, event_tx, availability, shutdown_rx, connected_seeders, connected_leechers, registry).await
 }
 
 /// Handle an already-established peer connection (used for both inbound and outbound).
 async fn handle_peer_with_conn(
     addr: SocketAddrV4,
     mut conn: PeerConnection,
+    client: String,
     metainfo: Arc<Metainfo>,
     piece_manager: Arc<Mutex<PieceManager>>,
     stats: Arc<RwLock<TransferStats>>,
@@ -744,8 +815,25 @@ async fn handle_peer_with_conn(
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     connected_seeders: Arc<AtomicUsize>,
     connected_leechers: Arc<AtomicUsize>,
+    registry: Arc<RwLock<std::collections::HashMap<SocketAddrV4, PeerInfo>>>,
 ) -> Result<(), EngineError> {
     let _ = event_tx.send(EngineEvent::PeerConnected(addr));
+
+    // Insert initial peer info into registry
+    {
+        let num_pieces = metainfo.num_pieces();
+        let info = PeerInfo {
+            addr,
+            is_seeder: false,
+            pieces_have: 0,
+            pieces_total: num_pieces,
+            peer_interested: false,
+            am_choking: true,
+            peer_choking: true,
+            client: client.clone(),
+        };
+        registry.write().await.insert(addr, info);
+    }
 
     let num_pieces = metainfo.num_pieces();
     let mut peer_bitfield = Bitfield::new(num_pieces);
@@ -789,6 +877,9 @@ async fn handle_peer_with_conn(
                         Message::KeepAlive => {}
                         Message::Choke => {
                             peer_choking = true;
+                            if let Some(info) = registry.write().await.get_mut(&addr) {
+                                info.peer_choking = true;
+                            }
                             // Reset any pending piece
                             if let Some(idx) = current_piece.take() {
                                 piece_manager.lock().await.reset_piece(idx);
@@ -798,6 +889,9 @@ async fn handle_peer_with_conn(
                         }
                         Message::Unchoke => {
                             peer_choking = false;
+                            if let Some(info) = registry.write().await.get_mut(&addr) {
+                                info.peer_choking = false;
+                            }
                             // Start requesting pieces
                             if current_piece.is_none() {
                                 let avail = availability.read().await;
@@ -839,13 +933,19 @@ async fn handle_peer_with_conn(
                                 }
                             }
                             // Classify peer as seeder or leecher
-                            if peer_bitfield.count_pieces() == num_pieces {
+                            let pieces_have = peer_bitfield.count_pieces();
+                            if pieces_have == num_pieces {
                                 peer_is_seeder = true;
                                 connected_seeders.fetch_add(1, Ordering::Relaxed);
                                 log::info!("Peer {} is a seeder (has all {} pieces)", addr, num_pieces);
                             } else {
                                 connected_leechers.fetch_add(1, Ordering::Relaxed);
-                                log::info!("Peer {} is a leecher (has {}/{} pieces)", addr, peer_bitfield.count_pieces(), num_pieces);
+                                log::info!("Peer {} is a leecher (has {}/{} pieces)", addr, pieces_have, num_pieces);
+                            }
+                            // Update registry
+                            if let Some(info) = registry.write().await.get_mut(&addr) {
+                                info.pieces_have = pieces_have;
+                                info.is_seeder = peer_is_seeder;
                             }
                         }
                         Message::Piece { index, begin, block } => {
@@ -936,10 +1036,17 @@ async fn handle_peer_with_conn(
                                 am_choking = false;
                                 log::info!("Unchoked peer {} for uploading", addr);
                             }
+                            if let Some(info) = registry.write().await.get_mut(&addr) {
+                                info.peer_interested = true;
+                                info.am_choking = am_choking;
+                            }
                         }
                         Message::NotInterested => {
                             peer_interested = false;
                             log::info!("Peer {} sent NotInterested", addr);
+                            if let Some(info) = registry.write().await.get_mut(&addr) {
+                                info.peer_interested = false;
+                            }
                         }
                         Message::Request { index, begin, length } => {
                             log::info!("Peer {} requested piece {} offset {} len {}", addr, index, begin, length);
@@ -998,6 +1105,9 @@ async fn handle_peer_with_conn(
         // Only decrement if we actually counted this peer (got their bitfield)
         connected_leechers.fetch_sub(1, Ordering::Relaxed);
     }
+
+    // Remove from registry
+    registry.write().await.remove(&addr);
 
     result
 }

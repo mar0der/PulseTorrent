@@ -25,6 +25,12 @@ interface TorrentInfo {
   warning: string | null;
 }
 
+interface GlobalStatsInfo {
+  total_downloaded: number;
+  total_uploaded: number;
+  ratio: number;
+}
+
 interface TorrentFileInfo {
   path: string;
   size: number;
@@ -66,6 +72,7 @@ function App() {
   const [defaultDownloadDir, setDefaultDownloadDir] = useState("");
   const [fileList, setFileList] = useState<TorrentFileInfo[]>([]);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; fileIndex: number } | null>(null);
+  const [globalStats, setGlobalStats] = useState<GlobalStatsInfo>({ total_downloaded: 0, total_uploaded: 0, ratio: 0 });
   const pollRef = useRef<number | null>(null);
   const torrentsRef = useRef<TorrentInfo[]>([]);
   const fileRequestGen = useRef(0);
@@ -108,13 +115,14 @@ function App() {
     refreshTorrents();
     pollRef.current = window.setInterval(async () => {
       for (const t of torrentsRef.current) {
-        if (t.status === "downloading" || t.status === "verifying" || t.status === "complete") {
+        if (t.status === "downloading" || t.status === "verifying" || t.status === "seeding") {
           try {
             await invoke("poll_events", { id: t.id });
           } catch (_) {}
         }
       }
       refreshTorrents();
+      invoke<GlobalStatsInfo>("get_global_stats").then(setGlobalStats).catch(() => {});
     }, 1000);
 
     return () => {
@@ -353,11 +361,11 @@ function App() {
                       )}
                     </>
                   )}
-                  {(t.status === "downloading" || t.status === "complete") && (
+                  {(t.status === "downloading" || t.status === "seeding") && (
                     <>
                       <span>&#8595; {formatSpeed(t.download_speed)}</span>
                       <span>&#8593; {formatSpeed(t.upload_speed)}</span>
-                      <span>{t.num_peers} peers ({t.connected_seeders}S / {t.connected_leechers}L)</span>
+                      <span>{t.num_peers} peers ({t.connected_seeders}S : {t.connected_leechers}L)</span>
                       {t.status === "downloading" && t.eta_secs !== null && (
                         <span className="stat-eta">ETA: {formatEta(t.eta_secs)}</span>
                       )}
@@ -381,7 +389,7 @@ function App() {
                       {t.progress > 0 ? "Resume" : "Start"}
                     </button>
                   )}
-                  {(t.status === "downloading" || t.status === "complete") && (
+                  {(t.status === "downloading" || t.status === "seeding") && (
                     <button
                       className="btn btn-small btn-warning"
                       onClick={(e) => {
@@ -392,6 +400,15 @@ function App() {
                       Pause
                     </button>
                   )}
+                  <button
+                    className="btn btn-small btn-secondary"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      invoke("open_download_dir", { id: t.id });
+                    }}
+                  >
+                    Open
+                  </button>
                   <button
                     className="btn btn-small btn-warning"
                     onClick={(e) => {
@@ -446,6 +463,14 @@ function App() {
                 <span className="detail-label">Uploaded</span>
                 <span className="detail-value">
                   {formatBytes(selectedTorrent.uploaded_bytes)}
+                </span>
+              </div>
+              <div className="detail-row">
+                <span className="detail-label">Ratio</span>
+                <span className="detail-value">
+                  {selectedTorrent.downloaded_bytes > 0
+                    ? (selectedTorrent.uploaded_bytes / selectedTorrent.downloaded_bytes).toFixed(3)
+                    : "0.000"}
                 </span>
               </div>
               {selectedTorrent.seeders !== null && (
@@ -559,6 +584,9 @@ function App() {
           )}{" "}
           | &#8593;{" "}
           {formatSpeed(torrents.reduce((acc, t) => acc + t.upload_speed, 0))}
+        </span>
+        <span>
+          Total: &#8595; {formatBytes(globalStats.total_downloaded)} | &#8593; {formatBytes(globalStats.total_uploaded)} | Ratio: {globalStats.ratio.toFixed(3)}
         </span>
       </footer>
     </div>

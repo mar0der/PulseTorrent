@@ -84,3 +84,32 @@ pub async fn delete_state(info_hash_hex: &str, state_dir: &Path) -> Result<(), P
     }
     Ok(())
 }
+
+/// Global client-wide traffic statistics.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GlobalStats {
+    /// Total bytes downloaded across all torrents, all time.
+    pub total_downloaded: u64,
+    /// Total bytes uploaded across all torrents, all time.
+    pub total_uploaded: u64,
+}
+
+/// Save global stats to `global_stats.json` (atomic: write tmp + rename).
+pub async fn save_global_stats(stats: &GlobalStats, state_dir: &Path) -> Result<(), PersistenceError> {
+    fs::create_dir_all(state_dir).await?;
+    let path = state_dir.join("global_stats.json");
+    let tmp_path = state_dir.join("global_stats.json.tmp");
+    let json = serde_json::to_string_pretty(stats)?;
+    fs::write(&tmp_path, json.as_bytes()).await?;
+    fs::rename(&tmp_path, &path).await?;
+    Ok(())
+}
+
+/// Load global stats from `global_stats.json`, returning defaults if missing.
+pub async fn load_global_stats(state_dir: &Path) -> GlobalStats {
+    let path = state_dir.join("global_stats.json");
+    match fs::read_to_string(&path).await {
+        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+        Err(_) => GlobalStats::default(),
+    }
+}

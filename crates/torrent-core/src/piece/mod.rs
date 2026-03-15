@@ -321,26 +321,57 @@ impl PieceManager {
     /// Rebuilds `piece_status` and `our_bitfield` from reality.
     /// Returns the number of verified-good pieces.
     pub async fn verify_pieces(&mut self) -> Result<usize, PieceError> {
+        self.verify_pieces_with_progress(|_, _, _| {}).await
+    }
+
+    /// Verify pieces with a progress callback: `f(checked_so_far, total_to_check, verified_so_far)`.
+    pub async fn verify_pieces_with_progress<F>(
+        &mut self,
+        mut on_progress: F,
+    ) -> Result<usize, PieceError>
+    where
+        F: FnMut(usize, usize, usize),
+    {
         let num_pieces = self.metainfo.num_pieces();
         let saved_bitfield = self.our_bitfield.clone();
+
+        // If the saved bitfield has no pieces set, scan ALL pieces from disk.
+        // This handles the case where a torrent is re-added pointing to a
+        // directory that already contains the complete (or partial) data.
+        let has_saved_pieces = saved_bitfield.count_pieces() > 0;
+
+        // Count how many pieces we'll actually check (for progress reporting)
+        let total_to_check = if has_saved_pieces {
+            saved_bitfield.count_pieces()
+        } else {
+            num_pieces
+        };
 
         // Reset bitfield — rebuild from verified data
         self.our_bitfield = Bitfield::new(num_pieces);
         let mut verified = 0;
+        let mut checked = 0;
 
         for piece_index in 0..num_pieces {
-            // Only verify pieces the saved bitfield claims are complete
-            if !saved_bitfield.has_piece(piece_index) {
+            // If we have a saved bitfield, only verify pieces it claims are complete.
+            // Otherwise (fresh add), try every piece — data may already exist on disk.
+            if has_saved_pieces && !saved_bitfield.has_piece(piece_index) {
                 continue;
             }
 
+            checked += 1;
+
             let piece_data = match self.read_piece(piece_index).await {
                 Ok(data) => data,
-                Err(_) => continue,
+                Err(_) => {
+                    on_progress(checked, total_to_check, verified);
+                    continue;
+                }
             };
 
             let expected_size = self.metainfo.piece_size(piece_index) as usize;
             if piece_data.len() != expected_size {
+                on_progress(checked, total_to_check, verified);
                 continue;
             }
 
@@ -350,6 +381,8 @@ impl PieceManager {
                 self.our_bitfield.set_piece(piece_index);
                 verified += 1;
             }
+
+            on_progress(checked, total_to_check, verified);
         }
 
         log::info!("Piece verification: {}/{} pieces valid", verified, num_pieces);

@@ -166,6 +166,14 @@
   background: rgba(46, 213, 115, 0.15);
   color: var(--success);
 }
+.status-seeding {
+  background: rgba(46, 213, 115, 0.15);
+  color: var(--success);
+}
+.status-verifying {
+  background: rgba(255, 165, 0, 0.15);
+  color: #ffa500;
+}
 
 /* Progress bar */
 .progress-bar {

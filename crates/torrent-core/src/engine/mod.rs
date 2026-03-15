@@ -759,18 +759,26 @@ async fn handle_peer_with_conn(
     let mut peer_is_seeder = false; // tracks if this peer has all pieces
 
     // Send our bitfield so the peer knows what we have
+    let we_are_seeder;
     {
         let pm = piece_manager.lock().await;
-        let bitfield_bytes = pm.bitfield_bytes();
-        // Only send if we have at least one piece
-        if pm.completed_pieces() > 0 {
+        let completed = pm.completed_pieces();
+        let total = pm.total_pieces();
+        we_are_seeder = pm.is_complete();
+        if completed > 0 {
+            let bitfield_bytes = pm.bitfield_bytes();
             conn.send(&Message::Bitfield(bitfield_bytes)).await?;
+            log::info!("Sent bitfield to peer {} ({}/{} pieces)", addr, completed, total);
+        } else {
+            log::info!("No pieces to send in bitfield to peer {}", addr);
         }
     }
 
-    // Send interested
-    conn.send(&Message::Interested).await?;
-    _am_interested = true;
+    // Only send Interested if we still need pieces — seeders don't request data
+    if !we_are_seeder {
+        conn.send(&Message::Interested).await?;
+        _am_interested = true;
+    }
 
     let result: Result<(), EngineError> = async {
         loop {
@@ -863,6 +871,8 @@ async fn handle_peer_with_conn(
                                     Ok(valid) => {
                                         if valid {
                                             let _ = event_tx.send(EngineEvent::PieceCompleted(index as usize));
+                                            // Announce to this peer that we now have this piece
+                                            conn.send(&Message::Have(index)).await?;
                                         }
                                     }
                                     Err(crate::piece::PieceError::Io(ref e))
@@ -919,20 +929,24 @@ async fn handle_peer_with_conn(
                         }
                         Message::Interested => {
                             peer_interested = true;
+                            log::info!("Peer {} sent Interested", addr);
                             // Unchoke the peer so they can request pieces from us
                             if am_choking {
                                 conn.send(&Message::Unchoke).await?;
                                 am_choking = false;
+                                log::info!("Unchoked peer {} for uploading", addr);
                             }
                         }
                         Message::NotInterested => {
                             peer_interested = false;
-                            let _ = peer_interested; // suppress unused warning
+                            log::info!("Peer {} sent NotInterested", addr);
                         }
                         Message::Request { index, begin, length } => {
+                            log::info!("Peer {} requested piece {} offset {} len {}", addr, index, begin, length);
                             // Serve block to peer if we have it and they're unchoked
                             if am_choking {
-                                continue; // Peer shouldn't request while choked
+                                log::warn!("Peer {} requested but is choked, ignoring", addr);
+                                continue;
                             }
                             let block_data = {
                                 let pm = piece_manager.lock().await;
@@ -940,16 +954,18 @@ async fn handle_peer_with_conn(
                             };
                             match block_data {
                                 Ok(data) => {
+                                    let len = data.len();
                                     conn.send(&Message::Piece {
                                         index,
                                         begin,
-                                        block: data.clone(),
+                                        block: data,
                                     }).await?;
+                                    log::info!("Uploaded block to peer {}: piece {} offset {} ({} bytes)", addr, index, begin, len);
                                     let mut s = stats.write().await;
-                                    s.uploaded_bytes += data.len() as u64;
+                                    s.uploaded_bytes += len as u64;
                                 }
                                 Err(e) => {
-                                    log::debug!("Failed to read block for peer {}: {}", addr, e);
+                                    log::warn!("Failed to read block for peer {}: {}", addr, e);
                                 }
                             }
                         }

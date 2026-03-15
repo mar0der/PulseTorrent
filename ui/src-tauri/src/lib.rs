@@ -1,6 +1,7 @@
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tauri::{Manager, State};
 use tokio::sync::{mpsc, RwLock};
@@ -8,7 +9,7 @@ use torrent_core::engine::{EngineEvent, TorrentEngine};
 use torrent_core::magnet::MagnetLink;
 use torrent_core::metadata;
 use torrent_core::peer::Bitfield;
-use torrent_core::persistence::{self, TorrentState};
+use torrent_core::persistence::{self, GlobalStats, TorrentState};
 use torrent_core::piece::{self as piece_ops, PieceManager};
 use torrent_core::torrent::Metainfo;
 
@@ -54,6 +55,10 @@ pub struct AppState {
     torrents: RwLock<HashMap<String, TorrentEntry>>,
     download_dir: RwLock<PathBuf>,
     state_dir: PathBuf,
+    /// Global all-time traffic stats (persisted to global_stats.json).
+    global_stats: RwLock<GlobalStats>,
+    /// Tracks last-known per-torrent bytes so we can compute deltas for global stats.
+    last_known_bytes: RwLock<HashMap<String, (u64, u64)>>,
 }
 
 struct TorrentEntry {
@@ -68,6 +73,11 @@ struct TorrentEntry {
     /// True after the first successful verify_pieces() in this session.
     /// Allows resume to skip re-reading all pieces from disk.
     bitfield_verified: bool,
+    /// Shared verification progress counters (checked, total, verified).
+    /// Written by verify_pieces callback, read by get_torrents for UI updates.
+    verify_checked: Arc<AtomicUsize>,
+    verify_total: Arc<AtomicUsize>,
+    verify_verified: Arc<AtomicUsize>,
 }
 
 impl AppState {
@@ -83,6 +93,8 @@ impl AppState {
             torrents: RwLock::new(HashMap::new()),
             download_dir: RwLock::new(download_dir),
             state_dir,
+            global_stats: RwLock::new(GlobalStats::default()),
+            last_known_bytes: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -97,7 +109,7 @@ fn build_torrent_state(entry: &TorrentEntry) -> TorrentState {
         num_pieces: entry.info.num_pieces,
         downloaded_bytes: entry.info.downloaded_bytes,
         uploaded_bytes: entry.info.uploaded_bytes,
-        status: entry.info.status.clone(),
+        status: if entry.info.status == "seeding" { "complete".to_string() } else { entry.info.status.clone() },
         skipped_files: entry.skipped_files.iter().copied().collect(),
     }
 }
@@ -215,6 +227,7 @@ fn calculate_file_progress(metainfo: &Metainfo, piece_progress: &[f64], skipped_
 
 #[tauri::command]
 async fn add_torrent(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     path: String,
     download_dir: Option<String>,
@@ -228,19 +241,71 @@ async fn add_torrent(
     };
 
     let id = metainfo.info_hash_hex();
+
+    // If this torrent is already in the list, just return its current info
+    {
+        let torrents = state.torrents.read().await;
+        if let Some(existing) = torrents.get(&id) {
+            return Ok(existing.info.clone());
+        }
+    }
+
+    // Check if there's a saved state file for this torrent (e.g. from a previous session)
+    let existing_state = {
+        let path = state.state_dir.join(format!("{}.json", id));
+        if path.exists() {
+            match tokio::fs::read_to_string(&path).await {
+                Ok(contents) => serde_json::from_str::<TorrentState>(&contents).ok(),
+                Err(_) => None,
+            }
+        } else {
+            None
+        }
+    };
+
+    // Restore progress from existing state if available
+    let (saved_bitfield, downloaded_bytes, uploaded_bytes, restored_skipped, pieces_done, progress) =
+        if let Some(ref saved) = existing_state {
+            let num_pieces = saved.num_pieces;
+            let pd = saved.completed_pieces.iter()
+                .enumerate()
+                .flat_map(|(byte_idx, &byte)| {
+                    (0..8).filter_map(move |bit| {
+                        let piece_idx = byte_idx * 8 + (7 - bit);
+                        if piece_idx < num_pieces && (byte & (1 << bit)) != 0 {
+                            Some(piece_idx)
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .count();
+            let prog = if num_pieces > 0 { pd as f64 / num_pieces as f64 } else { 0.0 };
+            (
+                saved.completed_pieces.clone(),
+                saved.downloaded_bytes,
+                saved.uploaded_bytes,
+                saved.skipped_files.iter().copied().collect::<HashSet<usize>>(),
+                pd,
+                prog,
+            )
+        } else {
+            (Vec::new(), 0, 0, HashSet::new(), 0, 0.0)
+        };
+
     let info = TorrentInfo {
         id: id.clone(),
         name: metainfo.name.clone(),
         total_size: metainfo.total_size,
         num_pieces: metainfo.num_pieces(),
-        pieces_done: 0,
-        downloaded_bytes: 0,
-        uploaded_bytes: 0,
+        pieces_done,
+        downloaded_bytes,
+        uploaded_bytes,
         download_speed: 0.0,
         upload_speed: 0.0,
         num_peers: 0,
         status: "paused".to_string(),
-        progress: 0.0,
+        progress,
         seeders: None,
         leechers: None,
         connected_seeders: 0,
@@ -256,22 +321,39 @@ async fn add_torrent(
         info: info.clone(),
         event_rx: None,
         download_dir: dl_dir,
-        saved_bitfield: Vec::new(),
+        saved_bitfield,
         last_saved: None,
-        skipped_files: HashSet::new(),
+        skipped_files: restored_skipped,
         bitfield_verified: false,
+        verify_checked: Arc::new(AtomicUsize::new(0)),
+        verify_total: Arc::new(AtomicUsize::new(0)),
+        verify_verified: Arc::new(AtomicUsize::new(0)),
     };
 
-    // Save state to disk
-    let torrent_state = build_torrent_state(&entry);
-    save_in_background(torrent_state, state.state_dir.clone());
+    // Only save state to disk for truly new torrents (don't overwrite existing state)
+    if existing_state.is_none() {
+        let torrent_state = build_torrent_state(&entry);
+        save_in_background(torrent_state, state.state_dir.clone());
+    }
 
-    state.torrents.write().await.insert(id, entry);
+    state.torrents.write().await.insert(id.clone(), entry);
+
+    // Auto-start in background: verify pieces and begin downloading/seeding.
+    // Returns immediately so the UI isn't blocked during piece verification.
+    let id_clone = id.clone();
+    tokio::spawn(async move {
+        let app_state = app.state::<AppState>();
+        if let Err(e) = start_torrent_inner(&app_state, id_clone.clone()).await {
+            log::warn!("Auto-start failed for {}: {}", id_clone, e);
+        }
+    });
+
     Ok(info)
 }
 
 #[tauri::command]
 async fn add_magnet(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     uri: String,
     download_dir: Option<String>,
@@ -339,6 +421,9 @@ async fn add_magnet(
             last_saved: None,
             skipped_files: HashSet::new(),
             bitfield_verified: false,
+        verify_checked: Arc::new(AtomicUsize::new(0)),
+        verify_total: Arc::new(AtomicUsize::new(0)),
+        verify_verified: Arc::new(AtomicUsize::new(0)),
         };
         state.torrents.write().await.insert(id.clone(), entry);
     }
@@ -390,17 +475,25 @@ async fn add_magnet(
         }
     }
 
+    // Auto-start in background: verify pieces and begin downloading/seeding
+    let bg_id = id.clone();
+    tokio::spawn(async move {
+        let app_state = app.state::<AppState>();
+        if let Err(e) = start_torrent_inner(&app_state, bg_id.clone()).await {
+            log::warn!("Auto-start failed for {}: {}", bg_id, e);
+        }
+    });
+
     Ok(info)
 }
 
-#[tauri::command]
-async fn start_torrent(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
+/// Inner start logic that takes `&AppState` directly (callable from both
+/// the IPC command and background auto-start tasks).
+async fn start_torrent_inner(state: &AppState, id: String) -> Result<(), String> {
     // Step 1: Quick guard + data extraction — hold write lock only briefly.
     let (metainfo, download_dir, saved_bitfield, num_pieces, skipped_files,
-         downloaded_bytes, uploaded_bytes, already_verified) = {
+         downloaded_bytes, uploaded_bytes, already_verified,
+         v_checked, v_total, v_verified) = {
         let mut torrents = state.torrents.write().await;
         let entry = torrents.get_mut(&id).ok_or("Torrent not found")?;
 
@@ -410,6 +503,10 @@ async fn start_torrent(
 
         // Mark as verifying so the UI shows progress and concurrent starts are rejected.
         entry.info.status = "verifying".to_string();
+        // Reset verification progress counters
+        entry.verify_checked.store(0, Ordering::Relaxed);
+        entry.verify_total.store(0, Ordering::Relaxed);
+        entry.verify_verified.store(0, Ordering::Relaxed);
 
         (
             entry.metainfo.clone(),
@@ -420,6 +517,9 @@ async fn start_torrent(
             entry.info.downloaded_bytes,
             entry.info.uploaded_bytes,
             entry.bitfield_verified,
+            entry.verify_checked.clone(),
+            entry.verify_total.clone(),
+            entry.verify_verified.clone(),
         )
     }; // write lock released — poll_events and get_torrents can now run freely
 
@@ -455,7 +555,11 @@ async fn start_torrent(
     let verified = if already_verified {
         pm.apply_bitfield_without_verify()
     } else {
-        match pm.verify_pieces().await {
+        match pm.verify_pieces_with_progress(|checked, total, verified| {
+            v_checked.store(checked, Ordering::Relaxed);
+            v_total.store(total, Ordering::Relaxed);
+            v_verified.store(verified, Ordering::Relaxed);
+        }).await {
             Ok(v) => v,
             Err(e) => {
                 if let Some(entry) = state.torrents.write().await.get_mut(&id) {
@@ -511,7 +615,7 @@ async fn start_torrent(
             entry.engine = Some(engine);
             entry.event_rx = Some(event_rx);
             entry.info.status = if is_complete {
-                "complete".to_string()
+                "seeding".to_string()
             } else {
                 "downloading".to_string()
             };
@@ -543,6 +647,14 @@ async fn start_torrent(
 }
 
 #[tauri::command]
+async fn start_torrent(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    start_torrent_inner(&state, id).await
+}
+
+#[tauri::command]
 async fn stop_torrent(
     state: State<'_, AppState>,
     id: String,
@@ -558,6 +670,9 @@ async fn stop_torrent(
         entry.info.uploaded_bytes = uploaded;
         engine.stop();
     }
+    let current_dl = entry.info.downloaded_bytes;
+    let current_ul = entry.info.uploaded_bytes;
+
     entry.engine = None;
     entry.event_rx = None;
     entry.info.status = "paused".to_string();
@@ -569,7 +684,29 @@ async fn stop_torrent(
     // Save state to disk
     let torrent_state = build_torrent_state(entry);
     save_in_background(torrent_state, state.state_dir.clone());
+    drop(torrents);
 
+    // Update and persist global stats
+    update_global_stats(&state, &id, current_dl, current_ul).await;
+    let gs = state.global_stats.read().await.clone();
+    save_global_stats_bg(gs, state.state_dir.clone());
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_download_dir(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let torrents = state.torrents.read().await;
+    let entry = torrents.get(&id).ok_or("torrent not found")?;
+    let dir = entry.download_dir.clone();
+    drop(torrents);
+
+    // Reveal the download directory in Finder/Explorer
+    tauri_plugin_opener::reveal_item_in_dir(&dir)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -635,6 +772,16 @@ async fn get_torrents(state: State<'_, AppState>) -> Result<Vec<TorrentInfo>, St
         // Cap downloaded_bytes at total_size for display (may overcount due to re-downloads)
         if info.total_size > 0 && info.downloaded_bytes > info.total_size {
             info.downloaded_bytes = info.total_size;
+        }
+        // Show live verification progress when status is "verifying"
+        if info.status == "verifying" {
+            let checked = e.verify_checked.load(Ordering::Relaxed);
+            let total = e.verify_total.load(Ordering::Relaxed);
+            let verified = e.verify_verified.load(Ordering::Relaxed);
+            if total > 0 {
+                info.progress = checked as f64 / total as f64;
+                info.pieces_done = verified;
+            }
         }
         info
     }).collect())
@@ -774,7 +921,7 @@ async fn poll_events(
                     };
                 }
                 EngineEvent::DownloadComplete => {
-                    entry.info.status = "complete".to_string();
+                    entry.info.status = "seeding".to_string();
                     entry.info.progress = 1.0;
                     entry.info.eta_secs = Some(0);
                     download_completed = true;
@@ -790,14 +937,20 @@ async fn poll_events(
         }
     }
 
+    // Capture bytes for global stats update (before dropping lock)
+    let current_dl = entry.info.downloaded_bytes;
+    let current_ul = entry.info.uploaded_bytes;
+
     // Save on download complete — use snapshot_bitfield (only pm lock, no stats lock)
     // Stats are already up-to-date from the Progress events above.
+    let mut should_save_global = false;
     if download_completed {
         if let Some(engine) = &entry.engine {
             entry.saved_bitfield = engine.snapshot_bitfield().await;
         }
         let torrent_state = build_torrent_state(entry);
         save_in_background(torrent_state, state.state_dir.clone());
+        should_save_global = true;
     }
 
     // Periodic save every 30 seconds during active download
@@ -814,7 +967,20 @@ async fn poll_events(
             entry.last_saved = Some(std::time::Instant::now());
             let torrent_state = build_torrent_state(entry);
             save_in_background(torrent_state, state.state_dir.clone());
+            should_save_global = true;
         }
+    }
+
+    // Release torrents lock before updating global stats
+    drop(torrents);
+
+    // Update global traffic stats with deltas
+    update_global_stats(&state, &id, current_dl, current_ul).await;
+
+    // Periodically persist global stats (piggyback on torrent save interval)
+    if should_save_global {
+        let gs = state.global_stats.read().await.clone();
+        save_global_stats_bg(gs, state.state_dir.clone());
     }
 
     Ok(events)
@@ -864,6 +1030,53 @@ async fn get_download_dir(state: State<'_, AppState>) -> Result<String, String> 
         .to_string())
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct GlobalStatsInfo {
+    pub total_downloaded: u64,
+    pub total_uploaded: u64,
+    pub ratio: f64,
+}
+
+#[tauri::command]
+async fn get_global_stats(state: State<'_, AppState>) -> Result<GlobalStatsInfo, String> {
+    let gs = state.global_stats.read().await;
+    let ratio = if gs.total_downloaded > 0 {
+        gs.total_uploaded as f64 / gs.total_downloaded as f64
+    } else {
+        0.0
+    };
+    Ok(GlobalStatsInfo {
+        total_downloaded: gs.total_downloaded,
+        total_uploaded: gs.total_uploaded,
+        ratio,
+    })
+}
+
+/// Update global stats by computing deltas from last-known per-torrent bytes.
+async fn update_global_stats(state: &AppState, id: &str, downloaded: u64, uploaded: u64) {
+    let mut last = state.last_known_bytes.write().await;
+    let (prev_dl, prev_ul) = last.get(id).copied().unwrap_or((0, 0));
+    let dl_delta = downloaded.saturating_sub(prev_dl);
+    let ul_delta = uploaded.saturating_sub(prev_ul);
+    last.insert(id.to_string(), (downloaded, uploaded));
+    drop(last);
+
+    if dl_delta > 0 || ul_delta > 0 {
+        let mut gs = state.global_stats.write().await;
+        gs.total_downloaded += dl_delta;
+        gs.total_uploaded += ul_delta;
+    }
+}
+
+/// Save global stats in the background.
+fn save_global_stats_bg(stats: GlobalStats, state_dir: PathBuf) {
+    tokio::spawn(async move {
+        if let Err(e) = persistence::save_global_stats(&stats, &state_dir).await {
+            log::error!("Failed to save global stats: {}", e);
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -877,12 +1090,14 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_log::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             add_torrent,
             add_magnet,
             start_torrent,
             stop_torrent,
             remove_torrent,
+            open_download_dir,
             get_torrents,
             get_torrent_files,
             toggle_file_skip,
@@ -890,6 +1105,7 @@ pub fn run() {
             change_torrent_download_dir,
             set_download_dir,
             get_download_dir,
+            get_global_stats,
         ])
         .on_window_event(|window, event| {
             // macOS: hide window instead of closing (minimize to dock)
@@ -905,6 +1121,10 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let app_state = app_handle.state::<AppState>();
                 let state_dir = app_state.state_dir.clone();
+
+                // Load global stats
+                let loaded_gs = persistence::load_global_stats(&state_dir).await;
+                *app_state.global_stats.write().await = loaded_gs;
 
                 let mut to_autostart = Vec::new();
 
@@ -933,7 +1153,8 @@ pub fn run() {
                                 0.0
                             };
 
-                            let should_autostart = saved.status == "downloading";
+                            let should_autostart = saved.status == "downloading" || saved.status == "complete";
+                            log::info!("Torrent {} status='{}' should_autostart={}", id, saved.status, should_autostart);
 
                             let info = TorrentInfo {
                                 id: id.clone(),
@@ -946,7 +1167,7 @@ pub fn run() {
                                 download_speed: 0.0,
                                 upload_speed: 0.0,
                                 num_peers: 0,
-                                status: if should_autostart {
+                                status: if should_autostart && saved.status == "downloading" {
                                     "paused".to_string() // Will be started shortly
                                 } else {
                                     saved.status.clone()
@@ -973,6 +1194,9 @@ pub fn run() {
                                 last_saved: None,
                                 skipped_files: restored_skipped,
                                 bitfield_verified: false,
+        verify_checked: Arc::new(AtomicUsize::new(0)),
+        verify_total: Arc::new(AtomicUsize::new(0)),
+        verify_verified: Arc::new(AtomicUsize::new(0)),
                             };
 
                             if should_autostart {
@@ -981,12 +1205,30 @@ pub fn run() {
 
                             torrents.insert(id, entry);
                         }
+                        // Initialize last_known_bytes so future deltas are correct
+                        let mut last = app_state.last_known_bytes.write().await;
+                        for (id, entry) in torrents.iter() {
+                            last.insert(id.clone(), (entry.info.downloaded_bytes, entry.info.uploaded_bytes));
+                        }
+                        drop(last);
+
                         log::info!("Loaded {} torrents from disk", torrents.len());
                     }
                     Err(e) => log::error!("Failed to load torrent states: {}", e),
                 }
 
-                // Auto-start torrents that were downloading
+                // Auto-start torrents: complete ones first (no verify needed),
+                // then downloading ones (need expensive disk verification).
+                {
+                    let torrents = app_state.torrents.read().await;
+                    to_autostart.sort_by_key(|id| {
+                        if torrents.get(id).map(|e| e.info.status.as_str()) == Some("complete") {
+                            0 // complete first
+                        } else {
+                            1 // downloading after
+                        }
+                    });
+                }
                 for id in to_autostart {
                     log::info!("Auto-starting torrent: {}", id);
                     let mut torrents = app_state.torrents.write().await;
@@ -1024,56 +1266,61 @@ pub fn run() {
                         pm.set_skipped_pieces(skipped);
                     }
 
-                    match pm.verify_pieces().await {
-                        Ok(verified) => {
-                            entry.info.pieces_done = verified;
-                            entry.info.progress = if entry.info.num_pieces > 0 {
-                                verified as f64 / entry.info.num_pieces as f64
+                    // Skip expensive disk verification for complete torrents —
+                    // all pieces were already verified when they were downloaded.
+                    let torrent_complete = entry.info.status == "complete";
+                    if !torrent_complete {
+                        match pm.verify_pieces().await {
+                            Ok(verified) => {
+                                entry.info.pieces_done = verified;
+                                entry.info.progress = if entry.info.num_pieces > 0 {
+                                    verified as f64 / entry.info.num_pieces as f64
+                                } else {
+                                    0.0
+                                };
+                                entry.saved_bitfield = pm.bitfield_bytes();
+                            }
+                            Err(e) => {
+                                log::error!("Piece verification failed for {}: {}", id, e);
+                                entry.info.status = "paused".to_string();
+                                continue;
+                            }
+                        }
+                    }
+
+                    let engine = Arc::new(TorrentEngine::with_piece_manager(
+                        entry.metainfo.clone(),
+                        download_dir,
+                        pm,
+                        entry.info.downloaded_bytes,
+                        entry.info.uploaded_bytes,
+                        event_tx,
+                    ));
+
+                    match engine.start().await {
+                        Ok(()) => {
+                            entry.engine = Some(engine);
+                            entry.event_rx = Some(event_rx);
+                            entry.info.status = if torrent_complete {
+                                "seeding".to_string()
                             } else {
-                                0.0
+                                "downloading".to_string()
                             };
-                            entry.saved_bitfield = pm.bitfield_bytes();
-                            let torrent_complete = pm.is_complete();
+                            log::info!("Auto-started torrent: {} (seeding: {})", id, torrent_complete);
 
-                            let engine = Arc::new(TorrentEngine::with_piece_manager(
-                                entry.metainfo.clone(),
-                                download_dir,
-                                pm,
-                                entry.info.downloaded_bytes,
-                                entry.info.uploaded_bytes,
-                                event_tx,
-                            ));
-
-                            match engine.start().await {
-                                Ok(()) => {
-                                    entry.engine = Some(engine);
-                                    entry.event_rx = Some(event_rx);
-                                    entry.info.status = if torrent_complete {
-                                        "complete".to_string()
-                                    } else {
-                                        "downloading".to_string()
-                                    };
-                                    log::info!("Auto-started torrent: {} (complete: {})", id, torrent_complete);
-
-                                    if !torrent_complete {
-                                        let meta = entry.metainfo.clone();
-                                        let dl_dir = entry.download_dir.clone();
-                                        let skipped = entry.skipped_files.clone();
-                                        tokio::spawn(async move {
-                                            if let Err(e) = piece_ops::preallocate_files(&meta, &dl_dir, &skipped).await {
-                                                log::warn!("File pre-allocation failed: {}", e);
-                                            }
-                                        });
+                            if !torrent_complete {
+                                let meta = entry.metainfo.clone();
+                                let dl_dir = entry.download_dir.clone();
+                                let skipped = entry.skipped_files.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = piece_ops::preallocate_files(&meta, &dl_dir, &skipped).await {
+                                        log::warn!("File pre-allocation failed: {}", e);
                                     }
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to auto-start torrent {}: {}", id, e);
-                                    entry.info.status = format!("error: {}", e);
-                                }
+                                });
                             }
                         }
                         Err(e) => {
-                            log::error!("Piece verification failed for {}: {}", id, e);
+                            log::error!("Failed to auto-start torrent {}: {}", id, e);
                             entry.info.status = format!("error: {}", e);
                         }
                     }
@@ -1110,7 +1357,7 @@ pub fn run() {
                         if let Ok(handle) = tokio::runtime::Handle::try_current() {
                             handle.block_on(async {
                                 let mut torrents = app_state.torrents.write().await;
-                                for entry in torrents.values_mut() {
+                                for (id, entry) in torrents.iter_mut() {
                                     // Skip placeholder entries (no metadata yet)
                                     if entry.metainfo.piece_length == 0 {
                                         continue;
@@ -1122,10 +1369,17 @@ pub fn run() {
                                         entry.info.downloaded_bytes = downloaded;
                                         entry.info.uploaded_bytes = uploaded;
                                     }
+                                    // Update global stats with final values
+                                    update_global_stats(app_state.inner(), id, entry.info.downloaded_bytes, entry.info.uploaded_bytes).await;
                                     let ts = build_torrent_state(entry);
                                     if let Err(e) = persistence::save_state(&ts, &state_dir).await {
                                         log::error!("Failed to save state on exit: {}", e);
                                     }
+                                }
+                                // Save global stats
+                                let gs = app_state.global_stats.read().await.clone();
+                                if let Err(e) = persistence::save_global_stats(&gs, &state_dir).await {
+                                    log::error!("Failed to save global stats on exit: {}", e);
                                 }
                             });
                         }

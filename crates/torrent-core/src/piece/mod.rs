@@ -303,6 +303,20 @@ impl PieceManager {
         &self.skipped_pieces
     }
 
+    /// Trust the saved bitfield without re-reading from disk.
+    /// Use only when pieces were already verified in the current session.
+    /// Returns the number of pieces marked complete.
+    pub fn apply_bitfield_without_verify(&mut self) -> usize {
+        let mut count = 0;
+        for i in 0..self.metainfo.num_pieces() {
+            if self.our_bitfield.has_piece(i) {
+                self.piece_status[i] = PieceStatus::Complete;
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Verify which pieces on disk match their expected SHA1 hashes.
     /// Rebuilds `piece_status` and `our_bitfield` from reality.
     /// Returns the number of verified-good pieces.

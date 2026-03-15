@@ -193,6 +193,16 @@
   margin-bottom: 8px;
 }
 
+/* Warning banner */
+.torrent-warning {
+  font-size: 11px;
+  color: #ff9800;
+  background: rgba(255, 152, 0, 0.1);
+  padding: 4px 8px;
+  border-radius: 4px;
+  margin-bottom: 6px;
+}
+
 /* Action buttons */
 .torrent-actions {
   display: flex;

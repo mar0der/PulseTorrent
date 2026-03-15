@@ -101,6 +101,8 @@ pub struct TorrentEngine {
     seeders: Arc<RwLock<Option<u64>>>,
     /// Leechers count from tracker.
     leechers: Arc<RwLock<Option<u64>>>,
+    /// Peers we've already tried connecting to (avoid duplicates across re-announces).
+    known_peers: Arc<RwLock<HashSet<SocketAddrV4>>>,
 }
 
 impl TorrentEngine {
@@ -129,6 +131,7 @@ impl TorrentEngine {
             active_peers: Arc::new(AtomicUsize::new(0)),
             seeders: Arc::new(RwLock::new(None)),
             leechers: Arc::new(RwLock::new(None)),
+            known_peers: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -166,46 +169,56 @@ impl TorrentEngine {
             metainfo.total_size.saturating_sub(done * metainfo.piece_length)
         };
 
-        // Try all trackers until we get peers
+        // Try all trackers in parallel
         let tracker_urls = self.tracker_urls();
         let mut all_peers: Vec<SocketAddrV4> = Vec::new();
+        let tracker_client = self.tracker_client;
+        let info_hash = metainfo.info_hash;
 
-        for url in &tracker_urls {
-            log::info!("Trying tracker: {}", url);
-            match self
-                .tracker_client
-                .announce_to_url(url, &metainfo.info_hash, 0, 0, left, Some("started"))
-                .await
-            {
-                Ok(response) => {
-                    log::info!(
-                        "Tracker {} returned {} peers (seeders: {:?}, leechers: {:?})",
-                        url,
-                        response.peers.len(),
-                        response.seeders,
-                        response.leechers
-                    );
-                    // Store seeders/leechers from first successful tracker
-                    if response.seeders.is_some() {
-                        *self.seeders.write().await = response.seeders;
-                    }
-                    if response.leechers.is_some() {
-                        *self.leechers.write().await = response.leechers;
-                    }
-                    // Deduplicate peers
-                    for peer in response.peers {
-                        if !all_peers.contains(&peer) {
-                            all_peers.push(peer);
-                        }
-                    }
-                    if all_peers.len() >= 50 {
-                        break; // Enough peers
+        let mut set = tokio::task::JoinSet::new();
+        for url in tracker_urls {
+            set.spawn(async move {
+                log::info!("Trying tracker: {}", url);
+                let result = tracker_client
+                    .announce_to_url(&url, &info_hash, 0, 0, left, Some("started"))
+                    .await;
+                (url, result)
+            });
+        }
+
+        let mut first_seeders: Option<u64> = None;
+        let mut first_leechers: Option<u64> = None;
+
+        while let Some(join_result) = set.join_next().await {
+            if let Ok((url, Ok(response))) = join_result {
+                log::info!(
+                    "Tracker {} returned {} peers (seeders: {:?}, leechers: {:?})",
+                    url,
+                    response.peers.len(),
+                    response.seeders,
+                    response.leechers
+                );
+                if first_seeders.is_none() {
+                    first_seeders = response.seeders;
+                }
+                if first_leechers.is_none() {
+                    first_leechers = response.leechers;
+                }
+                for peer in response.peers {
+                    if !all_peers.contains(&peer) {
+                        all_peers.push(peer);
                     }
                 }
-                Err(e) => {
-                    log::warn!("Tracker {} failed: {}", url, e);
-                }
+            } else if let Ok((url, Err(e))) = join_result {
+                log::warn!("Tracker {} failed: {}", url, e);
             }
+        }
+
+        if first_seeders.is_some() {
+            *self.seeders.write().await = first_seeders;
+        }
+        if first_leechers.is_some() {
+            *self.leechers.write().await = first_leechers;
         }
 
         if all_peers.is_empty() {
@@ -217,6 +230,14 @@ impl TorrentEngine {
         }
 
         log::info!("Total unique peers discovered: {}", all_peers.len());
+
+        // Track all peers we've seen
+        {
+            let mut known = self.known_peers.write().await;
+            for &p in &all_peers {
+                known.insert(p);
+            }
+        }
 
         // Connect to peers with a concurrency limit (max 30 at a time)
         // and stagger attempts to avoid overwhelming the network.
@@ -265,6 +286,146 @@ impl TorrentEngine {
             });
         }
 
+        // Re-announce loop: fetch fresh peers periodically when running low
+        {
+            let metainfo = self.metainfo.clone();
+            let pm = self.piece_manager.clone();
+            let stats = self.stats.clone();
+            let event_tx = self.event_tx.clone();
+            let availability = self.availability.clone();
+            let active_peers = self.active_peers.clone();
+            let known_peers = self.known_peers.clone();
+            let seeders = self.seeders.clone();
+            let leechers = self.leechers.clone();
+            let tracker_client = TrackerClient::new(6881);
+            let tracker_urls = self.tracker_urls();
+            let mut shutdown_rx = self.shutdown.subscribe();
+            let conn_semaphore = conn_semaphore.clone();
+            let peer_id = self.tracker_client.peer_id;
+
+            tokio::spawn(async move {
+                // Wait 30s before first re-announce, then every 30s
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                interval.tick().await; // skip immediate first tick
+
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let current_peers = active_peers.load(Ordering::Relaxed);
+                            if current_peers >= 3 {
+                                continue; // Enough peers, skip re-announce
+                            }
+
+                            // Check if download is complete
+                            if pm.lock().await.is_complete() {
+                                break;
+                            }
+
+                            log::info!("Re-announcing to trackers (active peers: {})", current_peers);
+
+                            let info_hash = metainfo.info_hash.clone();
+                            let left = {
+                                let pm = pm.lock().await;
+                                metainfo.total_size - (pm.completed_pieces() as u64 * metainfo.piece_length)
+                            };
+                            let s = stats.read().await;
+                            let downloaded = s.downloaded_bytes;
+                            let uploaded = s.uploaded_bytes;
+                            drop(s);
+
+                            let mut all_tracker_peers = Vec::new();
+                            for url in &tracker_urls {
+                                match tracker_client
+                                    .announce_to_url(url, &info_hash, downloaded, uploaded, left, None)
+                                    .await
+                                {
+                                    Ok(response) => {
+                                        if response.seeders.is_some() {
+                                            *seeders.write().await = response.seeders;
+                                        }
+                                        if response.leechers.is_some() {
+                                            *leechers.write().await = response.leechers;
+                                        }
+                                        for peer in response.peers {
+                                            if !all_tracker_peers.contains(&peer) {
+                                                all_tracker_peers.push(peer);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::debug!("Re-announce to {} failed: {}", url, e);
+                                    }
+                                }
+                            }
+
+                            // When no active peers, retry ALL tracker peers (they may have come back online).
+                            // When some peers remain, only try genuinely new ones.
+                            let peers_to_try: Vec<SocketAddrV4> = if current_peers == 0 {
+                                all_tracker_peers
+                            } else {
+                                let known = known_peers.read().await;
+                                all_tracker_peers.into_iter().filter(|p| !known.contains(p)).collect()
+                            };
+
+                            if peers_to_try.is_empty() {
+                                log::debug!("Re-announce found no peers to try");
+                                continue;
+                            }
+
+                            log::info!("Re-announce: trying {} peers", peers_to_try.len());
+
+                            // Track peers
+                            {
+                                let mut known = known_peers.write().await;
+                                for &p in &peers_to_try {
+                                    known.insert(p);
+                                }
+                            }
+
+                            // Spawn connections to peers
+                            for peer_addr in peers_to_try {
+                                let metainfo = metainfo.clone();
+                                let pm = pm.clone();
+                                let stats = stats.clone();
+                                let event_tx = event_tx.clone();
+                                let availability = availability.clone();
+                                let active_peers = active_peers.clone();
+                                let sem = conn_semaphore.clone();
+                                let mut shutdown_rx = shutdown_rx.clone();
+
+                                tokio::spawn(async move {
+                                    let _permit = match sem.acquire().await {
+                                        Ok(p) => p,
+                                        Err(_) => return,
+                                    };
+
+                                    active_peers.fetch_add(1, Ordering::Relaxed);
+                                    let result = handle_peer(
+                                        peer_addr,
+                                        metainfo,
+                                        pm,
+                                        stats,
+                                        event_tx.clone(),
+                                        availability,
+                                        peer_id,
+                                        &mut shutdown_rx,
+                                    )
+                                    .await;
+                                    active_peers.fetch_sub(1, Ordering::Relaxed);
+
+                                    if let Err(e) = result {
+                                        log::debug!("Peer {} error: {}", peer_addr, e);
+                                        let _ = event_tx.send(EngineEvent::PeerDisconnected(peer_addr));
+                                    }
+                                });
+                            }
+                        }
+                        _ = shutdown_rx.changed() => break,
+                    }
+                }
+            });
+        }
+
         // Stats reporting loop
         let stats = self.stats.clone();
         let pm = self.piece_manager.clone();
@@ -279,18 +440,24 @@ impl TorrentEngine {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        let mut s = stats.write().await;
-                        s.update();
+                        // Update stats and release the lock BEFORE acquiring pm
+                        // to avoid holding both locks simultaneously (which caused
+                        // deadlocks with snapshot_state/snapshot_bitfield).
+                        let (downloaded_bytes, uploaded_bytes, download_speed, upload_speed) = {
+                            let mut s = stats.write().await;
+                            s.update();
+                            (s.downloaded_bytes, s.uploaded_bytes, s.download_speed, s.upload_speed)
+                        }; // stats lock released here
+
                         let pm = pm.lock().await;
-                        // Report effective total (minus skipped) so progress reaches 100%
                         let effective_total = pm.total_pieces().saturating_sub(pm.skipped_count());
                         let _ = event_tx.send(EngineEvent::Progress {
                             pieces_done: pm.completed_pieces(),
                             pieces_total: effective_total,
-                            downloaded_bytes: s.downloaded_bytes,
-                            uploaded_bytes: s.uploaded_bytes,
-                            download_speed: s.download_speed,
-                            upload_speed: s.upload_speed,
+                            downloaded_bytes,
+                            uploaded_bytes,
+                            download_speed,
+                            upload_speed,
                             num_peers: active_peers.load(Ordering::Relaxed),
                             seeders: *seeders.read().await,
                             leechers: *leechers.read().await,
@@ -344,6 +511,7 @@ impl TorrentEngine {
             active_peers: Arc::new(AtomicUsize::new(0)),
             seeders: Arc::new(RwLock::new(None)),
             leechers: Arc::new(RwLock::new(None)),
+            known_peers: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -353,15 +521,24 @@ impl TorrentEngine {
     }
 
     /// Capture the current state for persistence.
+    /// Lock order: stats first, then pm (same as stats reporting loop to avoid deadlock).
     pub async fn snapshot_state(&self) -> (Vec<u8>, usize, u64, u64) {
-        let pm = self.piece_manager.lock().await;
         let stats = self.stats.read().await;
+        let downloaded = stats.downloaded_bytes;
+        let uploaded = stats.uploaded_bytes;
+        drop(stats);
+        let pm = self.piece_manager.lock().await;
         (
             pm.bitfield_bytes(),
             pm.total_pieces(),
-            stats.downloaded_bytes,
-            stats.uploaded_bytes,
+            downloaded,
+            uploaded,
         )
+    }
+
+    /// Get just the bitfield bytes without touching stats (avoids lock contention).
+    pub async fn snapshot_bitfield(&self) -> Vec<u8> {
+        self.piece_manager.lock().await.bitfield_bytes()
     }
 
     /// Get per-piece progress fractions (0.0-1.0) including partial blocks.
@@ -476,9 +653,33 @@ async fn handle_peer(
                             in_flight = in_flight.saturating_sub(1);
 
                             if complete {
-                                let valid = pm.finalize_piece(index as usize).await?;
-                                if valid {
-                                    let _ = event_tx.send(EngineEvent::PieceCompleted(index as usize));
+                                match pm.finalize_piece(index as usize).await {
+                                    Ok(valid) => {
+                                        if valid {
+                                            let _ = event_tx.send(EngineEvent::PieceCompleted(index as usize));
+                                        }
+                                    }
+                                    Err(crate::piece::PieceError::Io(ref e))
+                                        if e.raw_os_error() == Some(1) // EPERM
+                                            || e.kind() == std::io::ErrorKind::PermissionDenied =>
+                                    {
+                                        let msg = format!(
+                                            "Cannot write to disk: {}. Check folder permissions.",
+                                            e
+                                        );
+                                        log::error!("{}", msg);
+                                        let _ = event_tx.send(EngineEvent::Error(msg));
+                                        // Don't keep retrying — abort this peer loop
+                                        return Err(EngineError::Piece(
+                                            crate::piece::PieceError::Io(
+                                                std::io::Error::new(e.kind(), e.to_string()),
+                                            ),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        // Other disk errors — log but continue with next piece
+                                        log::warn!("Piece {} finalize error: {}", index, e);
+                                    }
                                 }
                                 current_piece = None;
                                 unsent_requests.clear();

@@ -19,6 +19,8 @@ interface TorrentInfo {
   seeders: number | null;
   leechers: number | null;
   download_dir: string;
+  eta_secs: number | null;
+  warning: string | null;
 }
 
 interface TorrentFileInfo {
@@ -38,6 +40,19 @@ function formatBytes(bytes: number): string {
 
 function formatSpeed(bytesPerSec: number): string {
   return formatBytes(bytesPerSec) + "/s";
+}
+
+function formatEta(secs: number): string {
+  if (secs <= 0) return "done";
+  if (secs >= 8640000) return "\u221E"; // infinity for > 100 days
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = Math.floor(secs % 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
 }
 
 function App() {
@@ -91,7 +106,7 @@ function App() {
     refreshTorrents();
     pollRef.current = window.setInterval(async () => {
       for (const t of torrentsRef.current) {
-        if (t.status === "downloading") {
+        if (t.status === "downloading" || t.status === "verifying") {
           try {
             await invoke("poll_events", { id: t.id });
           } catch (_) {}
@@ -173,10 +188,10 @@ function App() {
   const handleStart = async (id: string) => {
     try {
       await invoke("start_torrent", { id });
-      refreshTorrents();
     } catch (e) {
       console.error("Failed to start torrent:", e);
     }
+    refreshTorrents();
   };
 
   const handleStop = async (id: string) => {
@@ -206,6 +221,18 @@ function App() {
     window.addEventListener("click", close);
     return () => window.removeEventListener("click", close);
   }, [contextMenu]);
+
+  const handleChangeDir = async (id: string) => {
+    const folder = await pickDownloadFolder();
+    if (!folder) return;
+    try {
+      await invoke("change_torrent_download_dir", { id, path: folder });
+      refreshTorrents();
+    } catch (e: any) {
+      console.error("Failed to change download dir:", e);
+      alert(String(e));
+    }
+  };
 
   const handleRemove = async (id: string) => {
     try {
@@ -290,14 +317,14 @@ function App() {
                   <div
                     className="progress-fill"
                     style={{
-                      width: `${Math.min(t.progress * 100, 100)}%`,
+                      width: `${t.total_size > 0 ? Math.min((t.downloaded_bytes / t.total_size) * 100, 100) : 0}%`,
                     }}
                   />
                 </div>
 
                 <div className="torrent-stats">
                   <span>
-                    {Math.min(t.progress * 100, 100).toFixed(1)}%
+                    {t.total_size > 0 ? Math.min((t.downloaded_bytes / t.total_size) * 100, 100).toFixed(1) : "0.0"}%
                   </span>
                   <span>
                     {formatBytes(t.downloaded_bytes)} /{" "}
@@ -322,9 +349,16 @@ function App() {
                       <span>&#8595; {formatSpeed(t.download_speed)}</span>
                       <span>&#8593; {formatSpeed(t.upload_speed)}</span>
                       <span>{t.num_peers} peers</span>
+                      {t.eta_secs !== null && (
+                        <span className="stat-eta">ETA: {formatEta(t.eta_secs)}</span>
+                      )}
                     </>
                   )}
                 </div>
+
+                {t.warning && (
+                  <div className="torrent-warning">{t.warning}</div>
+                )}
 
                 <div className="torrent-actions">
                   {t.status === "paused" && (
@@ -418,10 +452,27 @@ function App() {
                   {selectedTorrent.num_peers}
                 </span>
               </div>
+              {selectedTorrent.eta_secs !== null && selectedTorrent.status === "downloading" && (
+                <div className="detail-row">
+                  <span className="detail-label">ETA</span>
+                  <span className="detail-value">
+                    {formatEta(selectedTorrent.eta_secs)}
+                  </span>
+                </div>
+              )}
               <div className="detail-row">
                 <span className="detail-label">Save to</span>
                 <span className="detail-value hash">
                   {selectedTorrent.download_dir}
+                  {selectedTorrent.status === "paused" && (
+                    <button
+                      className="btn btn-small btn-secondary"
+                      style={{ marginLeft: 8, fontSize: "0.75rem" }}
+                      onClick={() => handleChangeDir(selectedTorrent.id)}
+                    >
+                      Change
+                    </button>
+                  )}
                 </span>
               </div>
               <div className="detail-row">

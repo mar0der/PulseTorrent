@@ -22,7 +22,7 @@ pub struct TrackerResponse {
     pub leechers: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct TrackerClient {
     pub peer_id: [u8; 20],
     pub port: u16,

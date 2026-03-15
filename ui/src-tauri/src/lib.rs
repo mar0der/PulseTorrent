@@ -30,6 +30,10 @@ pub struct TorrentInfo {
     pub seeders: Option<u64>,
     pub leechers: Option<u64>,
     pub download_dir: String,
+    /// Estimated time remaining in seconds (None when paused or speed is zero).
+    pub eta_secs: Option<u64>,
+    /// Non-fatal warning (e.g. disk permission error on some peers). Cleared on next successful progress.
+    pub warning: Option<String>,
 }
 
 /// File info returned to the frontend.
@@ -57,6 +61,9 @@ struct TorrentEntry {
     saved_bitfield: Vec<u8>,
     last_saved: Option<std::time::Instant>,
     skipped_files: HashSet<usize>,
+    /// True after the first successful verify_pieces() in this session.
+    /// Allows resume to skip re-reading all pieces from disk.
+    bitfield_verified: bool,
 }
 
 impl AppState {
@@ -233,6 +240,8 @@ async fn add_torrent(
         seeders: None,
         leechers: None,
         download_dir: dl_dir.to_string_lossy().to_string(),
+        eta_secs: None,
+        warning: None,
     };
 
     let entry = TorrentEntry {
@@ -244,6 +253,7 @@ async fn add_torrent(
         saved_bitfield: Vec::new(),
         last_saved: None,
         skipped_files: HashSet::new(),
+        bitfield_verified: false,
     };
 
     // Save state to disk
@@ -295,6 +305,8 @@ async fn add_magnet(
         seeders: None,
         leechers: None,
         download_dir: dl_dir.to_string_lossy().to_string(),
+        eta_secs: None,
+        warning: None,
     };
 
     // Insert placeholder
@@ -318,6 +330,7 @@ async fn add_magnet(
             saved_bitfield: Vec::new(),
             last_saved: None,
             skipped_files: HashSet::new(),
+            bitfield_verified: false,
         };
         state.torrents.write().await.insert(id.clone(), entry);
     }
@@ -351,6 +364,8 @@ async fn add_magnet(
         seeders: None,
         leechers: None,
         download_dir: dl_dir.to_string_lossy().to_string(),
+        eta_secs: None,
+        warning: None,
     };
 
     {
@@ -373,93 +388,161 @@ async fn start_torrent(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
-    let mut torrents = state.torrents.write().await;
-    let entry = torrents.get_mut(&id).ok_or("Torrent not found")?;
+    // Step 1: Quick guard + data extraction — hold write lock only briefly.
+    let (metainfo, download_dir, saved_bitfield, num_pieces, skipped_files,
+         downloaded_bytes, uploaded_bytes, already_verified) = {
+        let mut torrents = state.torrents.write().await;
+        let entry = torrents.get_mut(&id).ok_or("Torrent not found")?;
 
-    if entry.engine.is_some() {
-        return Ok(()); // Already running
+        if entry.engine.is_some() || entry.info.status == "verifying" {
+            return Ok(()); // Already running or start already in progress
+        }
+        if entry.info.status == "complete" {
+            return Ok(());
+        }
+
+        // Mark as verifying so the UI shows progress and concurrent starts are rejected.
+        entry.info.status = "verifying".to_string();
+
+        (
+            entry.metainfo.clone(),
+            entry.download_dir.clone(),
+            entry.saved_bitfield.clone(),
+            entry.info.num_pieces,
+            entry.skipped_files.clone(),
+            entry.info.downloaded_bytes,
+            entry.info.uploaded_bytes,
+            entry.bitfield_verified,
+        )
+    }; // write lock released — poll_events and get_torrents can now run freely
+
+    // Step 2: Slow work with no lock held.
+
+    // Ensure download directory exists.
+    if let Err(e) = tokio::fs::create_dir_all(&download_dir).await {
+        if let Some(entry) = state.torrents.write().await.get_mut(&id) {
+            entry.info.status = "paused".to_string();
+        }
+        return Err(format!("Failed to create download directory: {}", e));
     }
-
-    if entry.info.status == "complete" {
-        return Ok(()); // Nothing to do
-    }
-
-    // Ensure download directory exists
-    let download_dir = entry.download_dir.clone();
-    tokio::fs::create_dir_all(&download_dir)
-        .await
-        .map_err(|e| format!("Failed to create download directory: {}", e))?;
 
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
-    // Create PieceManager - use saved bitfield for resume if available
-    let mut pm = if !entry.saved_bitfield.is_empty() {
+    let mut pm = if !saved_bitfield.is_empty() {
         PieceManager::with_saved_bitfield(
-            entry.metainfo.clone(),
+            metainfo.clone(),
             download_dir.clone(),
-            entry.saved_bitfield.clone(),
-            entry.info.num_pieces,
+            saved_bitfield,
+            num_pieces,
         )
     } else {
-        PieceManager::new(entry.metainfo.clone(), download_dir.clone())
+        PieceManager::new(metainfo.clone(), download_dir.clone())
     };
 
-    // Apply skipped files
-    if !entry.skipped_files.is_empty() {
-        let skipped = compute_skipped_pieces(&entry.metainfo, &entry.skipped_files);
+    if !skipped_files.is_empty() {
+        let skipped = compute_skipped_pieces(&metainfo, &skipped_files);
         pm.set_skipped_pieces(skipped);
     }
 
-    // Verify pieces on disk
-    let verified = pm.verify_pieces().await.map_err(|e| e.to_string())?;
+    // Verify pieces, or trust the already-verified bitfield for same-session resume.
+    let verified = if already_verified {
+        pm.apply_bitfield_without_verify()
+    } else {
+        match pm.verify_pieces().await {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(entry) = state.torrents.write().await.get_mut(&id) {
+                    entry.info.status = "paused".to_string();
+                }
+                return Err(e.to_string());
+            }
+        }
+    };
 
-    // Update entry info with verified count (progress accounts for skipped pieces)
     let skipped_count = pm.skipped_count();
-    let effective_total = entry.info.num_pieces.saturating_sub(skipped_count);
-    entry.info.pieces_done = verified;
-    entry.info.progress = if effective_total > 0 {
+    let effective_total = num_pieces.saturating_sub(skipped_count);
+    let progress = if effective_total > 0 {
         verified as f64 / effective_total as f64
     } else {
         0.0
     };
-    entry.saved_bitfield = pm.bitfield_bytes();
+    let new_bitfield = pm.bitfield_bytes();
+    let is_complete = pm.is_complete();
 
-    if pm.is_complete() {
-        entry.info.status = "complete".to_string();
-        entry.info.progress = 1.0;
-
-        let torrent_state = build_torrent_state(entry);
-        save_in_background(torrent_state, state.state_dir.clone());
+    // Handle already-complete case (no engine needed).
+    if is_complete {
+        let mut torrents = state.torrents.write().await;
+        if let Some(entry) = torrents.get_mut(&id) {
+            entry.info.pieces_done = verified;
+            entry.info.progress = 1.0;
+            entry.info.status = "complete".to_string();
+            entry.saved_bitfield = new_bitfield;
+            entry.bitfield_verified = true;
+            let torrent_state = build_torrent_state(entry);
+            save_in_background(torrent_state, state.state_dir.clone());
+        }
         return Ok(());
     }
 
     let engine = Arc::new(TorrentEngine::with_piece_manager(
-        entry.metainfo.clone(),
-        download_dir,
+        metainfo.clone(),
+        download_dir.clone(),
         pm,
-        entry.info.downloaded_bytes,
-        entry.info.uploaded_bytes,
+        downloaded_bytes,
+        uploaded_bytes,
         event_tx,
     ));
 
-    engine.start().await.map_err(|e| e.to_string())?;
+    // Tracker contact happens here — still no lock held.
+    let start_result = engine.start().await;
 
-    entry.engine = Some(engine);
-    entry.event_rx = Some(event_rx);
-    entry.info.status = "downloading".to_string();
+    // Step 3: Re-acquire write lock to commit results.
+    let mut torrents = state.torrents.write().await;
+    let entry = match torrents.get_mut(&id) {
+        Some(e) => e,
+        None => return Err("Torrent was removed during start".to_string()),
+    };
 
-    // Pre-allocate in background — uses standalone function so it does NOT hold the
-    // piece_manager lock, allowing downloads to proceed in parallel on slow volumes.
-    let meta = entry.metainfo.clone();
-    let dl_dir = entry.download_dir.clone();
-    let skipped = entry.skipped_files.clone();
-    tokio::spawn(async move {
-        if let Err(e) = piece_ops::preallocate_files(&meta, &dl_dir, &skipped).await {
-            log::warn!("File pre-allocation failed: {}", e);
+    // Guard against a concurrent start that beat us here (unlikely but safe).
+    if entry.engine.is_some() {
+        return Ok(());
+    }
+
+    // Always persist the verified bitfield so next resume skips re-verification.
+    entry.saved_bitfield = new_bitfield;
+    entry.info.pieces_done = verified;
+    entry.info.progress = progress;
+    entry.bitfield_verified = true;
+
+    match start_result {
+        Ok(()) => {
+            entry.engine = Some(engine);
+            entry.event_rx = Some(event_rx);
+            entry.info.status = "downloading".to_string();
+            entry.last_saved = Some(std::time::Instant::now()); // Don't trigger immediate save
+
+            // Pre-allocate in background — uses standalone function so it does NOT hold
+            // the piece_manager lock, allowing downloads to proceed on slow volumes.
+            let meta = entry.metainfo.clone();
+            let dl_dir = entry.download_dir.clone();
+            let skipped = entry.skipped_files.clone();
+            tokio::spawn(async move {
+                if let Err(e) = piece_ops::preallocate_files(&meta, &dl_dir, &skipped).await {
+                    log::warn!("File pre-allocation failed: {}", e);
+                }
+            });
+
+            Ok(())
         }
-    });
-
-    Ok(())
+        Err(e) => {
+            // Engine start failed (e.g. no peers). Reset to paused and save the
+            // verified bitfield so the next resume attempt skips re-verification.
+            entry.info.status = "paused".to_string();
+            let torrent_state = build_torrent_state(entry);
+            save_in_background(torrent_state, state.state_dir.clone());
+            Err(e.to_string())
+        }
+    }
 }
 
 #[tauri::command]
@@ -484,6 +567,7 @@ async fn stop_torrent(
     entry.info.download_speed = 0.0;
     entry.info.upload_speed = 0.0;
     entry.info.num_peers = 0;
+    entry.info.eta_secs = None;
 
     // Save state to disk
     let torrent_state = build_torrent_state(entry);
@@ -630,6 +714,7 @@ async fn poll_events(
                     leechers,
                 } => {
                     entry.info.pieces_done = *pieces_done;
+                    entry.info.warning = None; // Clear warning on successful progress
                     entry.info.downloaded_bytes = *downloaded_bytes;
                     entry.info.uploaded_bytes = *uploaded_bytes;
                     entry.info.download_speed = *download_speed;
@@ -642,14 +727,25 @@ async fn poll_events(
                     } else {
                         0.0
                     };
+                    // Calculate ETA from remaining bytes and current speed
+                    entry.info.eta_secs = if *download_speed > 0.0 {
+                        let remaining = entry.info.total_size as f64
+                            * (1.0 - entry.info.progress);
+                        Some((remaining / download_speed) as u64)
+                    } else {
+                        None
+                    };
                 }
                 EngineEvent::DownloadComplete => {
                     entry.info.status = "complete".to_string();
                     entry.info.progress = 1.0;
+                    entry.info.eta_secs = Some(0);
                     download_completed = true;
                 }
                 EngineEvent::Error(msg) => {
-                    entry.info.status = format!("error: {}", msg);
+                    // Non-fatal: store as warning, don't change status
+                    // (engine is still running with other peers)
+                    entry.info.warning = Some(msg.clone());
                 }
                 _ => {}
             }
@@ -657,29 +753,26 @@ async fn poll_events(
         }
     }
 
-    // Save on download complete
+    // Save on download complete — use snapshot_bitfield (only pm lock, no stats lock)
+    // Stats are already up-to-date from the Progress events above.
     if download_completed {
         if let Some(engine) = &entry.engine {
-            let (bitfield, _, downloaded, uploaded) = engine.snapshot_state().await;
-            entry.saved_bitfield = bitfield;
-            entry.info.downloaded_bytes = downloaded;
-            entry.info.uploaded_bytes = uploaded;
+            entry.saved_bitfield = engine.snapshot_bitfield().await;
         }
         let torrent_state = build_torrent_state(entry);
         save_in_background(torrent_state, state.state_dir.clone());
     }
 
     // Periodic save every 30 seconds during active download
+    // Use snapshot_bitfield instead of snapshot_state to avoid lock contention
+    // with the engine's stats reporting loop (which holds stats.write + pm.lock).
     if entry.engine.is_some() && !download_completed {
         let should_save = entry
             .last_saved
             .map_or(true, |t| t.elapsed() > std::time::Duration::from_secs(30));
         if should_save {
             if let Some(engine) = &entry.engine {
-                let (bitfield, _, downloaded, uploaded) = engine.snapshot_state().await;
-                entry.saved_bitfield = bitfield;
-                entry.info.downloaded_bytes = downloaded;
-                entry.info.uploaded_bytes = uploaded;
+                entry.saved_bitfield = engine.snapshot_bitfield().await;
             }
             entry.last_saved = Some(std::time::Instant::now());
             let torrent_state = build_torrent_state(entry);
@@ -688,6 +781,31 @@ async fn poll_events(
     }
 
     Ok(events)
+}
+
+#[tauri::command]
+async fn change_torrent_download_dir(
+    state: State<'_, AppState>,
+    id: String,
+    path: String,
+) -> Result<(), String> {
+    let mut torrents = state.torrents.write().await;
+    let entry = torrents.get_mut(&id).ok_or("Torrent not found")?;
+
+    if entry.engine.is_some() {
+        return Err("Stop the torrent before changing its download directory".to_string());
+    }
+
+    let new_dir = PathBuf::from(&path);
+    entry.download_dir = new_dir.clone();
+    entry.info.download_dir = path;
+    // Reset verification since files may differ in new location
+    entry.bitfield_verified = false;
+
+    let torrent_state = build_torrent_state(entry);
+    save_in_background(torrent_state, state.state_dir.clone());
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -713,6 +831,13 @@ async fn get_download_dir(state: State<'_, AppState>) -> Result<String, String> 
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::new())
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // Focus the existing window when a second instance is launched
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_log::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -725,6 +850,7 @@ pub fn run() {
             get_torrent_files,
             toggle_file_skip,
             poll_events,
+            change_torrent_download_dir,
             set_download_dir,
             get_download_dir,
         ])
@@ -792,6 +918,8 @@ pub fn run() {
                                 seeders: None,
                                 leechers: None,
                                 download_dir: saved.download_dir.to_string_lossy().to_string(),
+                                eta_secs: None,
+                                warning: None,
                             };
 
                             let restored_skipped: HashSet<usize> = saved.skipped_files.into_iter().collect();
@@ -805,6 +933,7 @@ pub fn run() {
                                 saved_bitfield: saved.completed_pieces,
                                 last_saved: None,
                                 skipped_files: restored_skipped,
+                                bitfield_verified: false,
                             };
 
                             if should_autostart {

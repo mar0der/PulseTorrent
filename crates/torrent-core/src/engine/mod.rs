@@ -316,9 +316,9 @@ impl TorrentEngine {
                                 continue; // Enough peers, skip re-announce
                             }
 
-                            // Check if download is complete
+                            // Skip re-announce if download is complete (seeding doesn't need more peers yet)
                             if pm.lock().await.is_complete() {
-                                break;
+                                continue;
                             }
 
                             log::info!("Re-announcing to trackers (active peers: {})", current_peers);
@@ -434,9 +434,13 @@ impl TorrentEngine {
         let active_peers = self.active_peers.clone();
         let seeders = self.seeders.clone();
         let leechers = self.leechers.clone();
+        let tracker_urls_for_complete = self.tracker_urls();
+        let info_hash_for_complete = self.metainfo.info_hash.clone();
+        let tracker_for_complete = TrackerClient::new(6881);
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
+            let mut download_complete_sent = false;
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
@@ -462,10 +466,30 @@ impl TorrentEngine {
                             seeders: *seeders.read().await,
                             leechers: *leechers.read().await,
                         });
-                        if pm.is_complete() {
+                        if pm.is_complete() && !download_complete_sent {
                             let _ = event_tx.send(EngineEvent::DownloadComplete);
-                            break;
+                            download_complete_sent = true;
+                            drop(pm); // Release pm before doing HTTP
+
+                            // Announce "completed" to tracker
+                            for url in &tracker_urls_for_complete {
+                                match tracker_for_complete
+                                    .announce_to_url(
+                                        url,
+                                        &info_hash_for_complete,
+                                        downloaded_bytes,
+                                        uploaded_bytes,
+                                        0, // left = 0 (we have everything)
+                                        Some("completed"),
+                                    )
+                                    .await
+                                {
+                                    Ok(_) => log::info!("Announced 'completed' to {}", url),
+                                    Err(e) => log::debug!("Failed to announce completed to {}: {}", url, e),
+                                }
+                            }
                         }
+                        // Keep running after completion (for stats/seeding)
                     }
                     _ = shutdown_rx.changed() => break,
                 }
@@ -567,9 +591,21 @@ async fn handle_peer(
     let mut peer_bitfield = Bitfield::new(num_pieces);
     let mut _am_interested = false;
     let mut peer_choking = true;
+    let mut peer_interested = false;
+    let mut am_choking = true;
     let mut unsent_requests: Vec<crate::piece::BlockRequest> = Vec::new();
     let mut in_flight: usize = 0;
     let mut current_piece: Option<usize> = None;
+
+    // Send our bitfield so the peer knows what we have
+    {
+        let pm = piece_manager.lock().await;
+        let bitfield_bytes = pm.bitfield_bytes();
+        // Only send if we have at least one piece
+        if pm.completed_pieces() > 0 {
+            conn.send(&Message::Bitfield(bitfield_bytes)).await?;
+        }
+    }
 
     // Send interested
     conn.send(&Message::Interested).await?;
@@ -711,8 +747,47 @@ async fn handle_peer(
                                 }
                             }
                         }
-                        Message::Interested | Message::NotInterested | Message::Request { .. } | Message::Cancel { .. } | Message::Extended { .. } => {
-                            // Seeding / extension logic: not yet implemented
+                        Message::Interested => {
+                            peer_interested = true;
+                            // Unchoke the peer so they can request pieces from us
+                            if am_choking {
+                                conn.send(&Message::Unchoke).await?;
+                                am_choking = false;
+                            }
+                        }
+                        Message::NotInterested => {
+                            peer_interested = false;
+                            let _ = peer_interested; // suppress unused warning
+                        }
+                        Message::Request { index, begin, length } => {
+                            // Serve block to peer if we have it and they're unchoked
+                            if am_choking {
+                                continue; // Peer shouldn't request while choked
+                            }
+                            let block_data = {
+                                let pm = piece_manager.lock().await;
+                                pm.read_block(index as usize, begin, length).await
+                            };
+                            match block_data {
+                                Ok(data) => {
+                                    conn.send(&Message::Piece {
+                                        index,
+                                        begin,
+                                        block: data.clone(),
+                                    }).await?;
+                                    let mut s = stats.write().await;
+                                    s.uploaded_bytes += data.len() as u64;
+                                }
+                                Err(e) => {
+                                    log::debug!("Failed to read block for peer {}: {}", addr, e);
+                                }
+                            }
+                        }
+                        Message::Cancel { .. } => {
+                            // Cancel: we don't queue outgoing pieces, so nothing to cancel
+                        }
+                        Message::Extended { .. } => {
+                            // Extension messages: handled elsewhere
                         }
                     }
                 }

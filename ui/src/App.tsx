@@ -106,7 +106,7 @@ function App() {
     refreshTorrents();
     pollRef.current = window.setInterval(async () => {
       for (const t of torrentsRef.current) {
-        if (t.status === "downloading" || t.status === "verifying") {
+        if (t.status === "downloading" || t.status === "verifying" || t.status === "complete") {
           try {
             await invoke("poll_events", { id: t.id });
           } catch (_) {}
@@ -234,9 +234,16 @@ function App() {
     }
   };
 
-  const handleRemove = async (id: string) => {
+  const handleRemove = async (id: string, deleteFiles: boolean) => {
+    if (deleteFiles) {
+      const torrent = torrents.find((t) => t.id === id);
+      const name = torrent?.name || id;
+      if (!window.confirm(`Delete "${name}" and all downloaded files from disk?\n\nThis cannot be undone.`)) {
+        return;
+      }
+    }
     try {
-      await invoke("remove_torrent", { id });
+      await invoke("remove_torrent", { id, deleteFiles });
       setTorrents((prev) => prev.filter((t) => t.id !== id));
       if (selectedId === id) setSelectedId(null);
     } catch (e) {
@@ -317,17 +324,17 @@ function App() {
                   <div
                     className="progress-fill"
                     style={{
-                      width: `${t.total_size > 0 ? Math.min((t.downloaded_bytes / t.total_size) * 100, 100) : 0}%`,
+                      width: `${Math.min(t.progress * 100, 100)}%`,
                     }}
                   />
                 </div>
 
                 <div className="torrent-stats">
                   <span>
-                    {t.total_size > 0 ? Math.min((t.downloaded_bytes / t.total_size) * 100, 100).toFixed(1) : "0.0"}%
+                    {Math.min(t.progress * 100, 100).toFixed(1)}%
                   </span>
                   <span>
-                    {formatBytes(t.downloaded_bytes)} /{" "}
+                    {formatBytes(Math.min(t.downloaded_bytes, t.total_size))} /{" "}
                     {formatBytes(t.total_size)}
                   </span>
                   {(t.status === "downloading" || t.status === "paused") && (
@@ -372,7 +379,7 @@ function App() {
                       {t.progress > 0 ? "Resume" : "Start"}
                     </button>
                   )}
-                  {t.status === "downloading" && (
+                  {(t.status === "downloading" || t.status === "complete") && (
                     <button
                       className="btn btn-small btn-warning"
                       onClick={(e) => {
@@ -384,13 +391,22 @@ function App() {
                     </button>
                   )}
                   <button
-                    className="btn btn-small btn-danger"
+                    className="btn btn-small btn-warning"
                     onClick={(e) => {
                       e.stopPropagation();
-                      handleRemove(t.id);
+                      handleRemove(t.id, false);
                     }}
                   >
                     Remove
+                  </button>
+                  <button
+                    className="btn btn-small btn-danger"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleRemove(t.id, true);
+                    }}
+                  >
+                    Delete
                   </button>
                 </div>
               </div>
@@ -421,7 +437,7 @@ function App() {
               <div className="detail-row">
                 <span className="detail-label">Downloaded</span>
                 <span className="detail-value">
-                  {formatBytes(selectedTorrent.downloaded_bytes)}
+                  {formatBytes(Math.min(selectedTorrent.downloaded_bytes, selectedTorrent.total_size))}
                 </span>
               </div>
               <div className="detail-row">

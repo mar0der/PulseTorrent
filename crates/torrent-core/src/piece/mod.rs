@@ -356,6 +356,29 @@ impl PieceManager {
         Ok(verified)
     }
 
+    /// Read a block from a completed piece on disk. Returns the block data.
+    /// Used by the upload path to serve blocks to peers.
+    pub async fn read_block(
+        &self,
+        piece_index: usize,
+        offset: u32,
+        length: u32,
+    ) -> Result<Vec<u8>, PieceError> {
+        if piece_index >= self.metainfo.num_pieces() {
+            return Err(PieceError::InvalidIndex(piece_index));
+        }
+        if !self.our_bitfield.has_piece(piece_index) {
+            return Err(PieceError::InvalidIndex(piece_index));
+        }
+        let piece_data = self.read_piece(piece_index).await?;
+        let start = offset as usize;
+        let end = start + length as usize;
+        if end > piece_data.len() {
+            return Err(PieceError::InvalidIndex(piece_index));
+        }
+        Ok(piece_data[start..end].to_vec())
+    }
+
     /// Read a piece from disk by reading the correct byte ranges from the appropriate file(s).
     async fn read_piece(&self, piece_index: usize) -> Result<Vec<u8>, PieceError> {
         let piece_size = self.metainfo.piece_size(piece_index) as usize;

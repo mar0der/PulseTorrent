@@ -397,9 +397,6 @@ async fn start_torrent(
         if entry.engine.is_some() || entry.info.status == "verifying" {
             return Ok(()); // Already running or start already in progress
         }
-        if entry.info.status == "complete" {
-            return Ok(());
-        }
 
         // Mark as verifying so the UI shows progress and concurrent starts are rejected.
         entry.info.status = "verifying".to_string();
@@ -469,21 +466,6 @@ async fn start_torrent(
     let new_bitfield = pm.bitfield_bytes();
     let is_complete = pm.is_complete();
 
-    // Handle already-complete case (no engine needed).
-    if is_complete {
-        let mut torrents = state.torrents.write().await;
-        if let Some(entry) = torrents.get_mut(&id) {
-            entry.info.pieces_done = verified;
-            entry.info.progress = 1.0;
-            entry.info.status = "complete".to_string();
-            entry.saved_bitfield = new_bitfield;
-            entry.bitfield_verified = true;
-            let torrent_state = build_torrent_state(entry);
-            save_in_background(torrent_state, state.state_dir.clone());
-        }
-        return Ok(());
-    }
-
     let engine = Arc::new(TorrentEngine::with_piece_manager(
         metainfo.clone(),
         download_dir.clone(),
@@ -518,19 +500,24 @@ async fn start_torrent(
         Ok(()) => {
             entry.engine = Some(engine);
             entry.event_rx = Some(event_rx);
-            entry.info.status = "downloading".to_string();
+            entry.info.status = if is_complete {
+                "complete".to_string()
+            } else {
+                "downloading".to_string()
+            };
             entry.last_saved = Some(std::time::Instant::now()); // Don't trigger immediate save
 
-            // Pre-allocate in background — uses standalone function so it does NOT hold
-            // the piece_manager lock, allowing downloads to proceed on slow volumes.
-            let meta = entry.metainfo.clone();
-            let dl_dir = entry.download_dir.clone();
-            let skipped = entry.skipped_files.clone();
-            tokio::spawn(async move {
-                if let Err(e) = piece_ops::preallocate_files(&meta, &dl_dir, &skipped).await {
-                    log::warn!("File pre-allocation failed: {}", e);
-                }
-            });
+            // Pre-allocate in background (skip for complete torrents)
+            if !is_complete {
+                let meta = entry.metainfo.clone();
+                let dl_dir = entry.download_dir.clone();
+                let skipped = entry.skipped_files.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = piece_ops::preallocate_files(&meta, &dl_dir, &skipped).await {
+                        log::warn!("File pre-allocation failed: {}", e);
+                    }
+                });
+            }
 
             Ok(())
         }
@@ -580,21 +567,50 @@ async fn stop_torrent(
 async fn remove_torrent(
     state: State<'_, AppState>,
     id: String,
+    delete_files: Option<bool>,
 ) -> Result<(), String> {
     let mut torrents = state.torrents.write().await;
+    let files_to_delete = if delete_files.unwrap_or(false) {
+        if let Some(entry) = torrents.get(&id) {
+            // Collect file paths before removing entry
+            let download_dir = entry.download_dir.clone();
+            let file_paths: Vec<PathBuf> = entry
+                .metainfo
+                .files
+                .iter()
+                .map(|f| download_dir.join(&f.path))
+                .collect();
+            Some(file_paths)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     if let Some(entry) = torrents.get(&id) {
         if let Some(engine) = &entry.engine {
             engine.stop();
         }
     }
     torrents.remove(&id);
+    drop(torrents); // Release lock before doing I/O
 
-    // Delete state file
+    // Delete state file and optionally downloaded files
     let state_dir = state.state_dir.clone();
     let id_clone = id.clone();
     tokio::spawn(async move {
         if let Err(e) = persistence::delete_state(&id_clone, &state_dir).await {
             log::error!("Failed to delete torrent state: {}", e);
+        }
+        if let Some(paths) = files_to_delete {
+            for path in paths {
+                if path.exists() {
+                    if let Err(e) = tokio::fs::remove_file(&path).await {
+                        log::error!("Failed to delete file {:?}: {}", path, e);
+                    }
+                }
+            }
         }
     });
 
@@ -604,7 +620,14 @@ async fn remove_torrent(
 #[tauri::command]
 async fn get_torrents(state: State<'_, AppState>) -> Result<Vec<TorrentInfo>, String> {
     let torrents = state.torrents.read().await;
-    Ok(torrents.values().map(|e| e.info.clone()).collect())
+    Ok(torrents.values().map(|e| {
+        let mut info = e.info.clone();
+        // Cap downloaded_bytes at total_size for display (may overcount due to re-downloads)
+        if info.total_size > 0 && info.downloaded_bytes > info.total_size {
+            info.downloaded_bytes = info.total_size;
+        }
+        info
+    }).collect())
 }
 
 #[tauri::command]
@@ -994,12 +1017,7 @@ pub fn run() {
                                 0.0
                             };
                             entry.saved_bitfield = pm.bitfield_bytes();
-
-                            if pm.is_complete() {
-                                entry.info.status = "complete".to_string();
-                                entry.info.progress = 1.0;
-                                continue;
-                            }
+                            let torrent_complete = pm.is_complete();
 
                             let engine = Arc::new(TorrentEngine::with_piece_manager(
                                 entry.metainfo.clone(),
@@ -1014,17 +1032,23 @@ pub fn run() {
                                 Ok(()) => {
                                     entry.engine = Some(engine);
                                     entry.event_rx = Some(event_rx);
-                                    entry.info.status = "downloading".to_string();
-                                    log::info!("Auto-started torrent: {}", id);
+                                    entry.info.status = if torrent_complete {
+                                        "complete".to_string()
+                                    } else {
+                                        "downloading".to_string()
+                                    };
+                                    log::info!("Auto-started torrent: {} (complete: {})", id, torrent_complete);
 
-                                    let meta = entry.metainfo.clone();
-                                    let dl_dir = entry.download_dir.clone();
-                                    let skipped = entry.skipped_files.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(e) = piece_ops::preallocate_files(&meta, &dl_dir, &skipped).await {
-                                            log::warn!("File pre-allocation failed: {}", e);
-                                        }
-                                    });
+                                    if !torrent_complete {
+                                        let meta = entry.metainfo.clone();
+                                        let dl_dir = entry.download_dir.clone();
+                                        let skipped = entry.skipped_files.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(e) = piece_ops::preallocate_files(&meta, &dl_dir, &skipped).await {
+                                                log::warn!("File pre-allocation failed: {}", e);
+                                            }
+                                        });
+                                    }
                                 }
                                 Err(e) => {
                                     log::error!("Failed to auto-start torrent {}: {}", id, e);

@@ -111,6 +111,7 @@ fn build_torrent_state(entry: &TorrentEntry) -> TorrentState {
         uploaded_bytes: entry.info.uploaded_bytes,
         status: if entry.info.status == "seeding" { "complete".to_string() } else { entry.info.status.clone() },
         skipped_files: entry.skipped_files.iter().copied().collect(),
+        bitfield_verified: entry.bitfield_verified,
     }
 }
 
@@ -1255,7 +1256,7 @@ pub fn run() {
                                 saved_bitfield: saved.completed_pieces,
                                 last_saved: None,
                                 skipped_files: restored_skipped,
-                                bitfield_verified: false,
+                                bitfield_verified: saved.bitfield_verified,
         verify_checked: Arc::new(AtomicUsize::new(0)),
         verify_total: Arc::new(AtomicUsize::new(0)),
         verify_verified: Arc::new(AtomicUsize::new(0)),
@@ -1328,52 +1329,57 @@ pub fn run() {
                         pm.set_skipped_pieces(skipped);
                     }
 
-                    // Always verify pieces on startup — even for "complete" torrents.
-                    // Files could have been moved, corrupted, or the app may have crashed
-                    // before data was fully flushed. Skipping verification caused complete
-                    // torrents to re-download from peers instead of seeding.
-                    let _was_complete = entry.info.status == "complete";
-                    entry.info.status = "verifying".to_string();
-                    // Set verify counters so the UI can show progress
-                    entry.verify_checked.store(0, Ordering::Relaxed);
-                    entry.verify_total.store(entry.info.num_pieces, Ordering::Relaxed);
-                    entry.verify_verified.store(0, Ordering::Relaxed);
+                    // If the bitfield was already verified (saved to disk after a
+                    // prior verification), trust it and skip the expensive SHA1 check.
+                    // Otherwise verify all pieces so we don't seed corrupt data.
+                    let needs_verify = !entry.bitfield_verified;
+                    if needs_verify {
+                        entry.info.status = "verifying".to_string();
+                        entry.verify_checked.store(0, Ordering::Relaxed);
+                        entry.verify_total.store(entry.info.num_pieces, Ordering::Relaxed);
+                        entry.verify_verified.store(0, Ordering::Relaxed);
+                    }
                     let vc = entry.verify_checked.clone();
                     let vt = entry.verify_total.clone();
                     let vv = entry.verify_verified.clone();
-                    // Drop the write lock during verification so the UI can poll progress
+                    // Drop the write lock so UI can poll progress during verification
                     drop(torrents);
-                    match pm.verify_pieces_with_progress(|checked, total, verified| {
-                        vc.store(checked, Ordering::Relaxed);
-                        vt.store(total, Ordering::Relaxed);
-                        vv.store(verified, Ordering::Relaxed);
-                    }).await {
-                        Ok(verified) => {
-                            let mut torrents = app_state.torrents.write().await;
-                            let entry = match torrents.get_mut(&id) {
-                                Some(e) => e,
-                                None => continue,
-                            };
-                            entry.info.pieces_done = verified;
-                            entry.info.progress = if entry.info.num_pieces > 0 {
-                                verified as f64 / entry.info.num_pieces as f64
-                            } else {
-                                0.0
-                            };
-                            entry.saved_bitfield = pm.bitfield_bytes();
-                            entry.bitfield_verified = true;
-                            // Drop the lock — we'll re-acquire below for engine creation.
-                        }
-                        Err(e) => {
-                            log::error!("Piece verification failed for {}: {}", id, e);
-                            let mut torrents = app_state.torrents.write().await;
-                            if let Some(entry) = torrents.get_mut(&id) {
-                                entry.info.status = "paused".to_string();
+
+                    if needs_verify {
+                        match pm.verify_pieces_with_progress(|checked, total, verified| {
+                            vc.store(checked, Ordering::Relaxed);
+                            vt.store(total, Ordering::Relaxed);
+                            vv.store(verified, Ordering::Relaxed);
+                        }).await {
+                            Ok(verified) => {
+                                let mut torrents = app_state.torrents.write().await;
+                                let entry = match torrents.get_mut(&id) {
+                                    Some(e) => e,
+                                    None => continue,
+                                };
+                                entry.info.pieces_done = verified;
+                                entry.info.progress = if entry.info.num_pieces > 0 {
+                                    verified as f64 / entry.info.num_pieces as f64
+                                } else {
+                                    0.0
+                                };
+                                entry.saved_bitfield = pm.bitfield_bytes();
+                                entry.bitfield_verified = true;
                             }
-                            continue;
+                            Err(e) => {
+                                log::error!("Piece verification failed for {}: {}", id, e);
+                                let mut torrents = app_state.torrents.write().await;
+                                if let Some(entry) = torrents.get_mut(&id) {
+                                    entry.info.status = "paused".to_string();
+                                }
+                                continue;
+                            }
                         }
+                    } else {
+                        pm.apply_bitfield_without_verify();
+                        log::info!("Skipping verification for {} — bitfield already verified", id);
                     }
-                    // Re-acquire the lock for the engine creation below
+
                     let mut torrents = app_state.torrents.write().await;
                     let entry = match torrents.get_mut(&id) {
                         Some(e) => e,

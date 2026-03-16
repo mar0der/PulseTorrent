@@ -504,7 +504,8 @@ impl TorrentEngine {
                             let info_hash = metainfo.info_hash.clone();
                             let left = {
                                 let pm = pm.lock().await;
-                                metainfo.total_size - (pm.completed_pieces() as u64 * metainfo.piece_length)
+                                let done_bytes = pm.completed_pieces() as u64 * metainfo.piece_length;
+                                metainfo.total_size.saturating_sub(done_bytes)
                             };
                             let s = stats.read().await;
                             let downloaded = s.downloaded_bytes;

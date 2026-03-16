@@ -34,6 +34,10 @@ pub struct TorrentState {
     /// File indices that the user has chosen to skip.
     #[serde(default)]
     pub skipped_files: Vec<usize>,
+    /// Whether the bitfield has been verified (SHA1-checked) since last save.
+    /// When true, the saved bitfield can be trusted on next load without re-verification.
+    #[serde(default)]
+    pub bitfield_verified: bool,
 }
 
 /// Save torrent state to a JSON file (atomic: write tmp + rename).

@@ -499,7 +499,7 @@ impl TorrentEngine {
                             let mut all_tracker_peers = Vec::new();
                             for url in &tracker_urls {
                                 match re_tracker_client
-                                    .announce_to_url(url, &info_hash, downloaded, uploaded, left, None)
+                                    .announce_to_url(url, &info_hash, uploaded, downloaded, left, None)
                                     .await
                                 {
                                     Ok(response) => {
@@ -651,8 +651,8 @@ impl TorrentEngine {
                                     .announce_to_url(
                                         url,
                                         &info_hash_for_complete,
-                                        downloaded_bytes,
                                         uploaded_bytes,
+                                        downloaded_bytes,
                                         0, // left = 0 (we have everything)
                                         Some("completed"),
                                     )

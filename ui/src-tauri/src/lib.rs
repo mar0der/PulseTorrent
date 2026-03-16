@@ -1328,27 +1328,58 @@ pub fn run() {
                         pm.set_skipped_pieces(skipped);
                     }
 
-                    // Skip expensive disk verification for complete torrents —
-                    // all pieces were already verified when they were downloaded.
-                    let torrent_complete = entry.info.status == "complete";
-                    if !torrent_complete {
-                        match pm.verify_pieces().await {
-                            Ok(verified) => {
-                                entry.info.pieces_done = verified;
-                                entry.info.progress = if entry.info.num_pieces > 0 {
-                                    verified as f64 / entry.info.num_pieces as f64
-                                } else {
-                                    0.0
-                                };
-                                entry.saved_bitfield = pm.bitfield_bytes();
-                            }
-                            Err(e) => {
-                                log::error!("Piece verification failed for {}: {}", id, e);
+                    // Always verify pieces on startup — even for "complete" torrents.
+                    // Files could have been moved, corrupted, or the app may have crashed
+                    // before data was fully flushed. Skipping verification caused complete
+                    // torrents to re-download from peers instead of seeding.
+                    let _was_complete = entry.info.status == "complete";
+                    entry.info.status = "verifying".to_string();
+                    // Set verify counters so the UI can show progress
+                    entry.verify_checked.store(0, Ordering::Relaxed);
+                    entry.verify_total.store(entry.info.num_pieces, Ordering::Relaxed);
+                    entry.verify_verified.store(0, Ordering::Relaxed);
+                    let vc = entry.verify_checked.clone();
+                    let vt = entry.verify_total.clone();
+                    let vv = entry.verify_verified.clone();
+                    // Drop the write lock during verification so the UI can poll progress
+                    drop(torrents);
+                    match pm.verify_pieces_with_progress(|checked, total, verified| {
+                        vc.store(checked, Ordering::Relaxed);
+                        vt.store(total, Ordering::Relaxed);
+                        vv.store(verified, Ordering::Relaxed);
+                    }).await {
+                        Ok(verified) => {
+                            let mut torrents = app_state.torrents.write().await;
+                            let entry = match torrents.get_mut(&id) {
+                                Some(e) => e,
+                                None => continue,
+                            };
+                            entry.info.pieces_done = verified;
+                            entry.info.progress = if entry.info.num_pieces > 0 {
+                                verified as f64 / entry.info.num_pieces as f64
+                            } else {
+                                0.0
+                            };
+                            entry.saved_bitfield = pm.bitfield_bytes();
+                            entry.bitfield_verified = true;
+                            // Drop the lock — we'll re-acquire below for engine creation.
+                        }
+                        Err(e) => {
+                            log::error!("Piece verification failed for {}: {}", id, e);
+                            let mut torrents = app_state.torrents.write().await;
+                            if let Some(entry) = torrents.get_mut(&id) {
                                 entry.info.status = "paused".to_string();
-                                continue;
                             }
+                            continue;
                         }
                     }
+                    // Re-acquire the lock for the engine creation below
+                    let mut torrents = app_state.torrents.write().await;
+                    let entry = match torrents.get_mut(&id) {
+                        Some(e) => e,
+                        None => continue,
+                    };
+                    let torrent_complete = entry.info.pieces_done == entry.info.num_pieces;
 
                     let engine = Arc::new(TorrentEngine::with_piece_manager(
                         entry.metainfo.clone(),

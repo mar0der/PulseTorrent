@@ -447,6 +447,16 @@ impl PieceManager {
         Ok(data)
     }
 
+    /// Check if we have a specific piece.
+    pub fn has_piece(&self, piece_index: usize) -> bool {
+        self.our_bitfield.has_piece(piece_index)
+    }
+
+    /// Get the download directory path.
+    pub fn download_dir(&self) -> &std::path::Path {
+        &self.download_dir
+    }
+
     /// Return the number of pieces that are skipped.
     pub fn skipped_count(&self) -> usize {
         self.skipped_pieces.len()
@@ -526,4 +536,54 @@ async fn allocate_single_file(
         log::info!("Pre-allocated: {} ({} bytes)", file_path.display(), file_info.length);
     }
     Ok(())
+}
+
+/// Read a block from disk without holding the PieceManager lock.
+/// Uses only the immutable metainfo to compute file offsets.
+pub async fn read_block_direct(
+    metainfo: &Metainfo,
+    download_dir: &std::path::Path,
+    piece_index: usize,
+    offset: u32,
+    length: u32,
+) -> Result<Vec<u8>, PieceError> {
+    if piece_index >= metainfo.num_pieces() {
+        return Err(PieceError::InvalidIndex(piece_index));
+    }
+    let piece_size = metainfo.piece_size(piece_index) as usize;
+    let piece_offset = piece_index as u64 * metainfo.piece_length;
+    let mut piece_data = vec![0u8; piece_size];
+    let mut file_offset_acc = 0u64;
+
+    for file_info in &metainfo.files {
+        let file_start = file_offset_acc;
+        let file_end = file_start + file_info.length;
+        file_offset_acc = file_end;
+
+        let piece_start = piece_offset;
+        let piece_end = piece_offset + piece_size as u64;
+
+        if piece_start >= file_end || piece_end <= file_start {
+            continue;
+        }
+
+        let read_start = std::cmp::max(piece_start, file_start);
+        let read_end = std::cmp::min(piece_end, file_end);
+        let read_len = (read_end - read_start) as usize;
+        let file_read_offset = read_start - file_start;
+        let data_read_offset = (read_start - piece_offset) as usize;
+
+        let file_path = download_dir.join(&file_info.path);
+        let mut file = fs::File::open(&file_path).await?;
+        file.seek(std::io::SeekFrom::Start(file_read_offset)).await?;
+        file.read_exact(&mut piece_data[data_read_offset..data_read_offset + read_len])
+            .await?;
+    }
+
+    let start = offset as usize;
+    let end = start + length as usize;
+    if end > piece_data.len() {
+        return Err(PieceError::InvalidIndex(piece_index));
+    }
+    Ok(piece_data[start..end].to_vec())
 }

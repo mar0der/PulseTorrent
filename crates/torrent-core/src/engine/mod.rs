@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::time::{Duration, Instant};
 
 #[derive(Debug, Error)]
@@ -135,6 +135,9 @@ pub struct TorrentEngine {
     connected_leechers: Arc<AtomicUsize>,
     /// Registry of all currently connected peers (for UI display).
     peer_registry: Arc<RwLock<std::collections::HashMap<SocketAddrV4, PeerInfo>>>,
+    /// Broadcast channel for Have messages — each peer task subscribes to receive
+    /// piece completion notifications and forwards Have to the remote peer.
+    have_tx: broadcast::Sender<u32>,
 }
 
 impl TorrentEngine {
@@ -150,6 +153,7 @@ impl TorrentEngine {
             download_dir.clone(),
         )));
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (have_tx, _) = broadcast::channel(256);
 
         Self {
             metainfo,
@@ -168,6 +172,7 @@ impl TorrentEngine {
             connected_seeders: Arc::new(AtomicUsize::new(0)),
             connected_leechers: Arc::new(AtomicUsize::new(0)),
             peer_registry: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            have_tx,
         }
     }
 
@@ -314,6 +319,8 @@ impl TorrentEngine {
             let c_seeders = self.connected_seeders.clone();
             let c_leechers = self.connected_leechers.clone();
             let registry = self.peer_registry.clone();
+            let have_rx = self.have_tx.subscribe();
+            let have_tx = self.have_tx.clone();
 
             tokio::spawn(async move {
                 // Stagger: small delay per batch to avoid burst
@@ -339,6 +346,8 @@ impl TorrentEngine {
                     c_seeders,
                     c_leechers,
                     registry.clone(),
+                    have_tx,
+                    have_rx,
                 )
                 .await;
                 active_peers.fetch_sub(1, Ordering::Relaxed);
@@ -366,6 +375,7 @@ impl TorrentEngine {
             let c_seeders = self.connected_seeders.clone();
             let c_leechers = self.connected_leechers.clone();
             let registry = self.peer_registry.clone();
+            let have_tx_incoming = self.have_tx.clone();
 
             tokio::spawn(async move {
                 loop {
@@ -385,6 +395,8 @@ impl TorrentEngine {
                                     let c_seeders = c_seeders.clone();
                                     let c_leechers = c_leechers.clone();
                                     let registry = registry.clone();
+                                    let have_rx = have_tx_incoming.subscribe();
+                                    let have_tx = have_tx_incoming.clone();
 
                                     tokio::spawn(async move {
                                         let _permit = match sem.acquire().await {
@@ -426,6 +438,8 @@ impl TorrentEngine {
                                             c_seeders,
                                             c_leechers,
                                             registry,
+                                            have_tx,
+                                            have_rx,
                                         ).await;
                                         active_peers.fetch_sub(1, Ordering::Relaxed);
 
@@ -465,6 +479,7 @@ impl TorrentEngine {
             let c_seeders = self.connected_seeders.clone();
             let c_leechers = self.connected_leechers.clone();
             let registry = self.peer_registry.clone();
+            let have_tx_reannounce = self.have_tx.clone();
 
             tokio::spawn(async move {
                 // Wait 30s before first re-announce, then every 30s
@@ -558,6 +573,8 @@ impl TorrentEngine {
                                 let c_seeders = c_seeders.clone();
                                 let c_leechers = c_leechers.clone();
                                 let registry = registry.clone();
+                                let have_rx = have_tx_reannounce.subscribe();
+                                let have_tx = have_tx_reannounce.clone();
 
                                 tokio::spawn(async move {
                                     let _permit = match sem.acquire().await {
@@ -578,6 +595,8 @@ impl TorrentEngine {
                                         c_seeders,
                                         c_leechers,
                                         registry.clone(),
+                                        have_tx,
+                                        have_rx,
                                     )
                                     .await;
                                     active_peers.fetch_sub(1, Ordering::Relaxed);
@@ -690,6 +709,7 @@ impl TorrentEngine {
         let num_pieces = metainfo.num_pieces();
         let metainfo = Arc::new(metainfo);
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (have_tx, _) = broadcast::channel(256);
 
         let mut stats = TransferStats::new();
         stats.downloaded_bytes = downloaded_bytes;
@@ -714,6 +734,7 @@ impl TorrentEngine {
             connected_seeders: Arc::new(AtomicUsize::new(0)),
             connected_leechers: Arc::new(AtomicUsize::new(0)),
             peer_registry: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            have_tx,
         }
     }
 
@@ -795,11 +816,13 @@ async fn handle_peer(
     connected_seeders: Arc<AtomicUsize>,
     connected_leechers: Arc<AtomicUsize>,
     registry: Arc<RwLock<std::collections::HashMap<SocketAddrV4, PeerInfo>>>,
+    have_tx: broadcast::Sender<u32>,
+    have_rx: broadcast::Receiver<u32>,
 ) -> Result<(), EngineError> {
     let (conn, peer_handshake) =
         PeerConnection::connect(addr, metainfo.info_hash, our_peer_id).await?;
     let client = parse_client_id(&peer_handshake.peer_id);
-    handle_peer_with_conn(addr, conn, client, metainfo, piece_manager, stats, event_tx, availability, shutdown_rx, connected_seeders, connected_leechers, registry).await
+    handle_peer_with_conn(addr, conn, client, metainfo, piece_manager, stats, event_tx, availability, shutdown_rx, connected_seeders, connected_leechers, registry, have_tx, have_rx).await
 }
 
 /// Handle an already-established peer connection (used for both inbound and outbound).
@@ -816,6 +839,8 @@ async fn handle_peer_with_conn(
     connected_seeders: Arc<AtomicUsize>,
     connected_leechers: Arc<AtomicUsize>,
     registry: Arc<RwLock<std::collections::HashMap<SocketAddrV4, PeerInfo>>>,
+    have_tx: broadcast::Sender<u32>,
+    mut have_rx: broadcast::Receiver<u32>,
 ) -> Result<(), EngineError> {
     let _ = event_tx.send(EngineEvent::PeerConnected(addr));
 
@@ -868,9 +893,20 @@ async fn handle_peer_with_conn(
         _am_interested = true;
     }
 
+    // Keep-alive timer: send every 90 seconds to prevent peer timeout (spec: 2 min)
+    let mut keepalive_interval = tokio::time::interval(Duration::from_secs(90));
+    keepalive_interval.tick().await; // skip immediate first tick
+
     let result: Result<(), EngineError> = async {
         loop {
             tokio::select! {
+                _ = keepalive_interval.tick() => {
+                    conn.send(&Message::KeepAlive).await?;
+                }
+                // Receive Have broadcasts from other peer tasks and forward to this peer
+                Ok(piece_index) = have_rx.recv() => {
+                    conn.send(&Message::Have(piece_index)).await?;
+                }
                 result = conn.receive() => {
                     let msg = result?;
                     match msg {
@@ -904,7 +940,7 @@ async fn handle_peer_with_conn(
                                 }
                             }
                             // Send up to 5 pipelined requests
-                            let count = std::cmp::min(5, unsent_requests.len());
+                            let count = std::cmp::min(10, unsent_requests.len());
                             let to_send: Vec<_> = unsent_requests.drain(..count).collect();
                             in_flight += to_send.len();
                             for req in &to_send {
@@ -971,7 +1007,10 @@ async fn handle_peer_with_conn(
                                     Ok(valid) => {
                                         if valid {
                                             let _ = event_tx.send(EngineEvent::PieceCompleted(index as usize));
-                                            // Announce to this peer that we now have this piece
+                                            // Broadcast Have to ALL connected peers via the broadcast channel.
+                                            // Each peer task's have_rx will pick this up and forward it.
+                                            // We also send directly to this peer (broadcast won't echo back to us).
+                                            let _ = have_tx.send(index);
                                             conn.send(&Message::Have(index)).await?;
                                         }
                                     }
@@ -1014,7 +1053,7 @@ async fn handle_peer_with_conn(
 
                             // Pipeline more requests — only send enough to fill up to 5 in-flight
                             if !peer_choking {
-                                let pipeline_slots = 5usize.saturating_sub(in_flight);
+                                let pipeline_slots = 10usize.saturating_sub(in_flight);
                                 let count = std::cmp::min(pipeline_slots, unsent_requests.len());
                                 let to_send: Vec<_> = unsent_requests.drain(..count).collect();
                                 in_flight += to_send.len();
@@ -1055,9 +1094,19 @@ async fn handle_peer_with_conn(
                                 log::warn!("Peer {} requested but is choked, ignoring", addr);
                                 continue;
                             }
+                            // Briefly lock to check we have the piece and get download dir,
+                            // then read from disk without the lock to avoid blocking other tasks.
                             let block_data = {
                                 let pm = piece_manager.lock().await;
-                                pm.read_block(index as usize, begin, length).await
+                                if !pm.has_piece(index as usize) {
+                                    Err(crate::piece::PieceError::InvalidIndex(index as usize))
+                                } else {
+                                    let dir = pm.download_dir().to_path_buf();
+                                    drop(pm); // Release lock before disk I/O
+                                    crate::piece::read_block_direct(
+                                        &metainfo, &dir, index as usize, begin, length,
+                                    ).await
+                                }
                             };
                             match block_data {
                                 Ok(data) => {
